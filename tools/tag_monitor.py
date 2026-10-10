@@ -219,7 +219,9 @@ def fmt_msp(o):
         vz = o.get("vz_cm_s")
         vz_text = "없음" if vz is None else f"{vz:+.1f}cm/s{' ⚠>10' if o.get('vz_warn') else ''}"
         base = o.get("base_rpy")
-        extra = (f" | 송신율 {o['tx_hz']}Hz{'(상시)' if o.get('tx_always') else ''}"
+        ack_hz = o.get("ack_hz")
+        ack_text = "" if ack_hz is None else f" FC수신 {ack_hz}Hz{' ⚠유실' if o.get('fc_link') and ack_hz < o['tx_hz'] * 0.9 else ''}"
+        extra = (f" | 송신율 {o['tx_hz']}Hz{'(상시)' if o.get('tx_always') else ''}{ack_text}"
                  f" · rcmap {o.get('rcmap')}({o.get('rcmap_src')}) · FC 마스크 {mask_text}"
                  f" · 기준점 {base} · vz {vz_text}")
     return (f"[MSP→FC] {link} · 제어권 {authority_text} · RC 송신 {'중' if rc_tx else '정지'}"

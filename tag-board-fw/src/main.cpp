@@ -638,9 +638,31 @@ struct MspStats {
   uint32_t txHz = 0;             // 지난 1초 동안 실제로 보낸 SET_RAW_RC 수
   uint32_t txCountWindow = 0;
   uint32_t txWindowStartMs = 0;
+  // FC 가 실제로 받아 처리한 비율의 증거: 지난 1초 동안의 SET_RAW_RC ack 수 · MSP_RC 응답 수.
+  // INAV 는 MSP 포트당 10ms 에 명령 하나만 처리하므로(msp_serial.c "process one command at a time")
+  // 보드가 초당 100개 넘게 보내면 프레임이 버려진다. ack_hz ≈ tx_hz 여야 정상.
+  uint32_t ackHz = 0, rcHz = 0;
+  uint32_t ackCountWindow = 0, rcCountWindow = 0;
 };
 static MspStats g_msp;
 static portMUX_TYPE g_mspMux = portMUX_INITIALIZER_UNLOCKED;
+
+// 1초 창이 끝나면 tx/ack/rc 초당 횟수를 확정한다 (g_mspMux 안에서 호출). 창 길이는 20ms 단위로
+// 끊기므로 실제 경과 시간으로 정규화해 50 이 55 로 보이는 일을 막는다.
+static void rateWindowStep(uint32_t now) {
+  uint32_t elapsed = now - g_msp.txWindowStartMs;
+  if (elapsed < 1000) return;
+  if (g_msp.txWindowStartMs == 0) {  // 첫 창: 부팅 뒤 경과 시간이 섞이므로 버린다
+    g_msp.txCountWindow = g_msp.ackCountWindow = g_msp.rcCountWindow = 0;
+    g_msp.txWindowStartMs = now;
+    return;
+  }
+  g_msp.txHz = (g_msp.txCountWindow * 1000u + elapsed / 2) / elapsed;
+  g_msp.ackHz = (g_msp.ackCountWindow * 1000u + elapsed / 2) / elapsed;
+  g_msp.rcHz = (g_msp.rcCountWindow * 1000u + elapsed / 2) / elapsed;
+  g_msp.txCountWindow = g_msp.ackCountWindow = g_msp.rcCountWindow = 0;
+  g_msp.txWindowStartMs = now;
+}
 
 // FC 채널 설정 (rcmap · msp_override_channels). 부팅 뒤 FC_CFG_POLL_MS 마다 읽는다.
 // rcmap[논리] = 프레임 슬롯. 논리 순서 롤 0, 피치 1, 요 2, 스로틀 3 (INAV rx.c).
@@ -827,10 +849,12 @@ static void handleMspReply(const MspReply &r) {
     g_msp.lastRxMs = millis();
     if (r.cmd == MSP_SET_RAW_RC) {
       g_msp.acks++;
+      g_msp.ackCountWindow++;
     } else if (r.cmd == MSP_SET_MOTOR) {
       g_msp.motorAcks++;
     } else if (r.cmd == MSP_RC) {
       g_msp.rcReplies++;
+      g_msp.rcCountWindow++;
       uint8_t n = min<uint16_t>(r.size / 2, MSP_CHANNELS);
       for (uint8_t i = 0; i < n; i++) g_msp.fcRc[i] = r.payload[2 * i] | (r.payload[2 * i + 1] << 8);
       g_msp.fcRcCount = n;
@@ -1214,7 +1238,8 @@ static void emitMspStatus() {
            "{\"type\":\"msp\",\"enabled\":%s,\"fc_link\":%s,\"sent\":%lu,\"acks\":%lu,\"rc_replies\":%lu,"
            "\"errors\":%lu,\"out\":[%s],\"fc_rc\":[%s],\"authority\":\"%s\",\"authority_fresh\":%s,"
            "\"ch5\":%s,\"ch6\":%s,\"rc_throttle\":%s,\"rc_tx\":%s,\"phase\":\"%s\",\"throttle_ctrl\":%s,"
-           "\"kill\":%s,\"kill_tx\":%s,\"tx_hz\":%lu,\"tx_always\":%s,\"rcmap\":\"%s\",\"rcmap_src\":\"%s\","
+           "\"kill\":%s,\"kill_tx\":%s,\"tx_hz\":%lu,\"ack_hz\":%lu,\"rc_hz\":%lu,\"tx_always\":%s,"
+           "\"rcmap\":\"%s\",\"rcmap_src\":\"%s\","
            "\"fc_mask\":%s,\"mask_ok\":%s,\"mask_recommended\":%u,\"thr_slot\":%u,\"thr_slot_us\":%u,"
            "\"base_rpy\":[%.0f,%.0f,%.0f],\"pilot_rpy\":[%u,%u,%u],\"pilot_valid\":%s,\"auto_since_ms\":%lu,"
            "\"vz_cm_s\":%s,\"vz_warn\":%s,\"vz_warn_count\":%lu}",
@@ -1223,7 +1248,8 @@ static void emitMspStatus() {
            authority.automatic ? "auto" : "manual", authority.fresh ? "true" : "false",
            ch5, ch6, throttle, rcTx ? "true" : "false", PHASE_CODE[c.phase],
            CTRL_THROTTLE_ENABLED ? "true" : "false", flags.kill ? "true" : "false",
-           killTx ? "true" : "false", (unsigned long)m.txHz, MSP_TX_ALWAYS ? "true" : "false", rcmap_s,
+           killTx ? "true" : "false", (unsigned long)m.txHz, (unsigned long)m.ackHz, (unsigned long)m.rcHz,
+           MSP_TX_ALWAYS ? "true" : "false", rcmap_s,
            cfg.rcmapFromFc ? "fc" : "default", mask_s, maskOk_s, (unsigned)OVERRIDE_MASK_RECOMMENDED,
            frameSlot(FC_RC_CH_THROTTLE), rcTx ? m.out[frameSlot(FC_RC_CH_THROTTLE)] : 0,
            ho.base[0], ho.base[1], ho.base[2], ho.pilot[0], ho.pilot[1], ho.pilot[2],
@@ -1488,10 +1514,12 @@ static void mspTask(void *) {
 
     fcQueryStep();
     fcConfigPollStep();  // rcmap · msp_override_channels (2s 마다)
-    switch (cycle % FC_POLL_PERIOD) {  // 상태·배터리·모터 출력을 번갈아 요청 (각 2Hz)
-      case 3: { uint8_t f[12]; Serial2.write(f, mspEncodeV2(MSP2_INAV_STATUS, nullptr, 0, f)); break; }
-      case 11: { uint8_t f[12]; Serial2.write(f, mspEncodeV2(MSP2_INAV_ANALOG, nullptr, 0, f)); break; }
-      case 19: { uint8_t f[8]; Serial2.write(f, mspEncode(MSP_MOTOR, nullptr, 0, f)); break; }
+    // 질의 예산: INAV 는 포트당 10ms 에 명령 하나(100/s). SET_RAW_RC 50/s 외 나머지는 ≤45/s (config.h 참고)
+    switch (cycle % FC_POLL_PERIOD) {  // 상태 2Hz(아밍 감지), 배터리·모터 출력 1Hz
+      case 7:
+      case 32: { uint8_t f[12]; Serial2.write(f, mspEncodeV2(MSP2_INAV_STATUS, nullptr, 0, f)); break; }
+      case 23: { uint8_t f[12]; Serial2.write(f, mspEncodeV2(MSP2_INAV_ANALOG, nullptr, 0, f)); break; }
+      case 41: { uint8_t f[8]; Serial2.write(f, mspEncode(MSP_MOTOR, nullptr, 0, f)); break; }
     }
     if (cycle % FC_ALT_POLL_EVERY == 0) {  // MTF-01P가 FC에 연결된 구성의 높이 (10Hz)
       uint8_t f[8];
@@ -1551,20 +1579,12 @@ static void mspTask(void *) {
       } else {
         g_msp.errors++;
       }
-      if (nowTx - g_msp.txWindowStartMs >= 1000) {
-        g_msp.txHz = g_msp.txCountWindow;
-        g_msp.txCountWindow = 0;
-        g_msp.txWindowStartMs = nowTx;
-      }
+      rateWindowStep(nowTx);
       portEXIT_CRITICAL(&g_mspMux);
       if (written && releasePending) consumeKillReleaseFrame();
     } else {
       portENTER_CRITICAL(&g_mspMux);
-      if (millis() - g_msp.txWindowStartMs >= 1000) {
-        g_msp.txHz = g_msp.txCountWindow;
-        g_msp.txCountWindow = 0;
-        g_msp.txWindowStartMs = millis();
-      }
+      rateWindowStep(millis());
       portEXIT_CRITICAL(&g_mspMux);
     }
 

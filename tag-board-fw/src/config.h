@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 // 빌드 식별자 (부팅 메시지에 출력)
 // ---------------------------------------------------------------------------
-#define FW_BUILD "TAGVISION-20261010-25"
+#define FW_BUILD "TAGVISION-20261010-26"
 
 // ---------------------------------------------------------------------------
 // MTF-01P (115200 8N1, 100Hz) — Micolink·MSP(INAV 출력) 자동 구분. 기존 RIDER-SERIAL 펌웨어와 같은 핀
@@ -28,7 +28,12 @@
 // AUTO 로 바뀌는 순간 이미 최신 프레임이 FC 안에 있어 통신 대기·초기화 지연이 없다.
 #define MSP_SEND_HZ 50          // INAV msp_override 는 50Hz 로 채널을 갱신한다 (DELAY_50_HZ)
 #define MSP_TX_ALWAYS true      // false 면 예전처럼 CH6=AUTO 일 때만 보낸다
-#define MSP_POLL_EVERY 1        // 매 주기 MSP_RC 요청 (50Hz) → CH6 전환을 한두 주기(20~40ms) 안에 감지
+// ★ FC 처리 한도: INAV 9.1 msp_serial.c 는 MSP 포트당 SERIAL 태스크 한 번(10ms)에 명령 **하나** 만 처리한다
+//   ("process one command at a time so as not to block") → 포트당 최대 100 명령/s. SET_RAW_RC 50/s 를 빼면
+//   나머지 질의는 모두 합쳐 50/s 미만, 여유를 두어 ≤40/s 로 맞춘다. -25 는 152/s 를 보내 FC 가 절반을 버렸다
+//   (ack 55%, fcmsp 응답 유실). msp 줄의 ack_hz ≈ tx_hz 로 확인한다.
+//   현재 예산(접근 shadow/on): RC 16.7 + 광류 10 + 높이 10 + 자세 2 + 상태 2 + 배터리 1 + 모터 1 + 설정 1 ≈ 44/s → 총 94/s
+#define MSP_POLL_EVERY 3        // MSP_RC 요청 16.7Hz → CH6 전환을 ≤60ms 안에 감지 (FC 적용은 즉시, 이건 보드 인지)
 #define MSP_LINK_TIMEOUT_MS 1000
 #define MSP_CHANNELS 8          // 롤·피치·스로틀·요 + AUX 4개 (AUX는 INAV 마스크에 넣지 않으면 무시됨)
 
@@ -67,21 +72,21 @@
 #define KILL_ON_US 2000
 #define KILL_OFF_US 1000
 
-// FC 상태 읽기: 50Hz 주기 중 이 간격마다 상태·배터리·모터 출력을 번갈아 요청 (각 2Hz)
-#define FC_POLL_PERIOD 25
+// FC 상태 읽기: 50Hz 주기 중 이 간격마다 상태(2Hz)·배터리·모터 출력(각 1Hz)을 번갈아 요청 (FC 처리 한도 때문)
+#define FC_POLL_PERIOD 50
 #define FC_STATUS_SAFE_TIMEOUT_MS 1000  // 모터 시험은 이보다 오래된 아밍 상태로 시작·지속하지 않음
 
 // 높이: 20261010부터 MTF-01P는 FC UART4에 연결한다(INAV rangefinder·opflow = MSP).
 // 보드에 MTF-01P 데이터가 직접 들어오지 않으면 FC의 거리센서 값(MSP_SONAR_ALTITUDE, cm)을 대신 쓴다.
-// 50Hz 주기 중 이 간격마다 한 번 요청 → 5 = 10Hz
+// 50Hz 주기 중 이 간격마다 한 번 요청 → 5 = 10Hz (FLOW_STALE_MS 300 안에 응답 하나를 잃어도 유지되는 최소)
 #define FC_ALT_POLL_EVERY 5
 // MTF-01 수직 속도 경고: |vz| 가 이 값을 넘으면 경고만 기록한다. 보드는 스로틀(CH3)을 절대 건드리지 않는다.
 #define VZ_WARN_CM_S 10.0f
 #define VZ_WARN_REPEAT_MS 1000
 
 // 접근 제어 (src/approach.h): 광류·자세를 FC에서 읽는 주기 (50Hz 주기 중 간격)
-#define FC_FLOW_POLL_EVERY 2    // MSP2_INAV_OPTICAL_FLOW 25Hz
-#define FC_ATT_POLL_EVERY 5     // MSP_ATTITUDE 10Hz
+#define FC_FLOW_POLL_EVERY 5    // MSP2_INAV_OPTICAL_FLOW 10Hz (INAV opflow 갱신도 ~10Hz)
+#define FC_ATT_POLL_EVERY 25    // MSP_ATTITUDE 2Hz (att_comp 기본 0 = 미사용. 쓰려면 10 으로 올리고 예산 재계산)
 // 부팅 시 접근 제어 모드: 0 off · 1 shadow(계산·로그만, FC에는 중립) · 2 on · 3 legacy(아래 4µs/cm 위치 제어)
 // 검증 전에는 shadow 로 올린다. `approach on|shadow|legacy|off`로 바꾼다.
 #define APPROACH_MODE_DEFAULT 1
