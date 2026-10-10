@@ -1,0 +1,6 @@
+﻿# PlatformIO 빌드 산출물·라이브러리 캐시 (빌드하면 다시 생긴다)
+tag-board-fw/.pio/
+__pycache__/
+*.pyc
+.env
+.venv/

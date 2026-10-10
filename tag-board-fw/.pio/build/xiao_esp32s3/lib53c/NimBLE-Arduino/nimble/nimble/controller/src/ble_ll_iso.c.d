@@ -1,2 +1,0 @@
-.pio/build/xiao_esp32s3/lib53c/NimBLE-Arduino/nimble/nimble/controller/src/ble_ll_iso.c.o: \
- .pio/libdeps/xiao_esp32s3/NimBLE-Arduino/src/nimble/nimble/controller/src/ble_ll_iso.c
