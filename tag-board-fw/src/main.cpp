@@ -950,6 +950,7 @@ static void emitApproach(const RcAuthoritySnapshot &authority) {
 // allowThrottle: 실제 FC로는 CTRL_THROTTLE_ENABLED일 때만, 시뮬레이터로는 항상 허용한다.
 static void computeSticks(uint16_t ch[MSP_CHANNELS], bool allowThrottle, bool kill) {
   for (int i = 0; i < MSP_CHANNELS; i++) ch[i] = 1500;
+  if (!allowThrottle) ch[MSP_CH_THROTTLE] = MSP_THROTTLE_SAFE_US;  // 스로틀은 절대 중간값으로 보내지 않는다
   ch[MSP_CH_KILL] = kill ? KILL_ON_US : KILL_OFF_US;  // 태그·판단과 무관하게 항상
   CtrlState c = ctrlSnapshot();
   FlowState f = flowSnapshot();
@@ -1275,6 +1276,7 @@ static void mspTask(void *) {
       bool releaseOnly = releasePending && !flags.mspEnabled && !flags.kill;
       if (releaseOnly) {
         for (int i = 0; i < MSP_CHANNELS; i++) ch[i] = 1500;
+        ch[MSP_CH_THROTTLE] = MSP_THROTTLE_SAFE_US;
         ch[MSP_CH_KILL] = KILL_OFF_US;
       } else {
         computeSticks(ch, CTRL_THROTTLE_ENABLED, flags.kill);
