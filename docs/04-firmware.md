@@ -72,12 +72,18 @@ python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --port /dev/cu.usbmodem
 | decimate | 자동 (시작 3.0, 2.0/3.0/4.0 중 선택) |
 | 정렬 판정 | 착륙 지점이 기체 바로 아래에서 3cm 이내 |
 | 축 매핑 | `CAM_ROTATE_DEG 0`, `AXES_VERIFIED false` (실측 전) |
-| MSP 송신 | 20Hz, 8채널(AETR + AUX4), MSP_RC 확인 요청은 4번에 1번 |
-| **킬 채널** | `MSP_CH_KILL 6` = ch7. 평소 1000, `kill`이면 2000 |
-| FC 상태 읽기 | 상태·배터리·모터 출력을 번갈아 각 2Hz (`FC_POLL_PERIOD 10`) |
-| FC 높이 읽기 (`-21`) | `MSP_SONAR_ALTITUDE` 10Hz (`FC_ALT_POLL_EVERY 2`). MTF-01P가 보드에 직접 연결돼 있지 않을 때 사용 |
-| 제어 이득 | 롤·피치 4µs/cm, 최대 ±80µs. 스로틀 3µs/cm, 최대 ±60µs |
-| 스로틀 제어 | `CTRL_THROTTLE_ENABLED false` (실제 FC로는 항상 1500. 시뮬레이터에만 허용) |
+| MSP 송신 (`-25`~) | **50Hz, CH6와 무관하게 상시 송신** (`MSP_SEND_HZ 50`, `MSP_TX_ALWAYS true`). 8채널, 슬롯 순서는 FC `rcmap`(기본 AETR) |
+| FC 질의 예산 (`-26`) | INAV는 MSP 포트당 10ms에 명령 **하나**만 처리(100/s). SET_RAW_RC 50 + `MSP_RC` 16.7(`MSP_POLL_EVERY 3`) + 광류 10 + 높이 10 + 자세 2 + 상태 2 + 배터리 1 + 모터 1 + 설정 1 ≈ 94/s. 늘리기 전에 `config.h` 주석의 예산을 먼저 고친다 |
+| **스로틀 슬롯** (`-24`~) | 항상 **1000** (`MSP_THROTTLE_SAFE_US`). 보드에는 스로틀 계산 경로가 없다. FC 마스크에 스로틀 비트(8)가 있으면 제어기가 `fault:"mask"` |
+| **킬 채널** | `MSP_CH_KILL 6` = ch7. 평소 1000, `kill`이면 2000 (FC 마스크에 64가 있어야 반영) |
+| 제어권 (`-23`~) | `MSP_RC`의 ch6(인덱스 5)가 900~1700이면 AUTO, 그 밖·응답 없음(250ms)이면 MANUAL. 수동이면 제어기 출력 0 |
+| FC 상태 읽기 | 상태 2Hz, 배터리·모터 출력 1Hz (`FC_POLL_PERIOD 50`) |
+| FC 높이 읽기 (`-21`) | `MSP_SONAR_ALTITUDE` 10Hz (`FC_ALT_POLL_EVERY 5`). MTF-01P가 보드에 직접 연결돼 있지 않을 때 사용 |
+| FC 설정 읽기 (`-25`) | 2초마다 `MSP_RX_MAP`(rcmap)과 `MSP2_COMMON_SETTING "msp_override_channels"`. 못 읽으면 `mask_unknown`으로 출력 차단 |
+| 접근 제어 (`-23`~, `approach.h`) | 목표속도 ≤10cm/s(`max_speed`), 25cm 안에서 감속, 5cm 안 정지, 가속 10cm/s², 광류 속도 P 제어, 명령 상한 ±cmd_max·변화율 cmd_slew. deadband 안·도착 뒤 중립, 태그 유실 즉시 중립, 실측 12cm/s 넘으면 제동. 부팅 모드 `shadow`(계산·로그만) |
+| MTF vz 경고 (`-25`) | FC 높이로 수직속도 추정, \|vz\|>10cm/s면 `warn` 1초 1회. 스로틀은 건드리지 않음 |
+| 레거시 제어 이득 (`approach legacy`) | 롤·피치 4µs/cm, 최대 ±80µs |
+| 스로틀 제어 | `CTRL_THROTTLE_ENABLED false` (시뮬레이터에만 허용) |
 | 미션 | 50cm → 3초 유지 → 100cm, 도달 판정 ±5cm |
 | 모터 시험 한도 | 15%(1150), 5초 |
 | 카메라 서보 (`-21`) | D8 팬·D9 틸트, 50Hz, 14비트, 0° = 1500µs, 10µs/°, 팬 ±90°·틸트 −30~90°, 최대 120°/s, 정지 판정 250ms ([13](13-camera-pan-tilt.md)) |
@@ -107,6 +113,7 @@ python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --port /dev/cu.usbmodem
 | `cam` … (`-21`) | `cam` 상태 / `cam <팬°> <틸트°>` / `cam down` / `cam front` / `cam off` / `cam us <팬µs> <틸트µs>`(보정) |
 | `rec <초>` | 0.2~3초 녹음 → `MIC_BEGIN` … `MIC_END` |
 | `voicecmd <키워드>` | 음성 명령 표의 명령 실행 (`motortest`·`voicecmd`·`fcmsp`는 거부) |
+| `approach` … (`-23`~) | `approach` 상태 / `approach on\|shadow\|legacy\|off` 모드 / `approach reset` / `approach params` / `approach set <이름> <값>`. 재부팅하면 `shadow`로. `on`은 FC 마스크가 정상(스로틀 비트 없음)일 때만 출력 |
 
 ## 출력 메시지 (한 줄에 JSON 하나)
 
@@ -118,7 +125,11 @@ python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --port /dev/cu.usbmodem
 | `tag` | 태그마다 | id, registered, meaning, side_px, rot_deg, tag_size_mm, land_px, img_right/up_cm, dist_est_cm, margin |
 | `target` | 미션 태그가 보이는 프레임마다 | id, decision(OVER_TARGET/MOVE, `-21`: GIMBAL_MOVING/NO_GEOMETRY), move_ko, next_ko, phase, body_right/fwd_cm, offset_cm, height_cm, decimate, candidates. `-21`: height_src, gimbal{pan,tilt,settled}, range_src(tag_size/height), ray_down, control_use |
 | `vision` | 2Hz | fps, detect_ms, ids, target_id, decimate_used/next, dec_mode, dec_reason, phase, gimbal·height_src(`-21`) |
-| `msp` | 1Hz | enabled, fc_link, sent, acks, rc_replies, errors, out(보낸 값), fc_rc(FC가 쓰는 값: 롤·피치·**요·스로틀**·AUX), phase, kill |
+| `msp` | 1Hz | enabled, fc_link, sent, acks, rc_replies, errors, out(보낸 값, rcmap 슬롯 순서), fc_rc(FC가 쓰는 값, 논리 순서: 롤·피치·요·스로틀·AUX), phase, kill. `-23`~: authority(auto/manual), authority_fresh, ch5, ch6, rc_throttle, rc_tx. `-25`~: tx_hz, tx_always, rcmap, rcmap_src(fc/default), fc_mask, mask_ok, mask_recommended, thr_slot, thr_slot_us, base_rpy(핸드오버 기준점), pilot_rpy, pilot_valid, auto_since_ms, vz_cm_s, vz_warn, vz_warn_count. `-26`: **ack_hz**(FC가 1초에 ack한 SET_RAW_RC 수, 정상이면 ≈tx_hz), rc_hz |
+| `approach` (`-23`~) | 5Hz | mode, state(IDLE/APPROACH/ARRIVING/ARRIVED/HOLD/FAULT), fault, dist_cm, err_right/fwd_cm, target_speed, v_target, v_flow, v_flow_valid, flow_q, roll_us, pitch_us, tag, authority, ch6, height_cm, height_valid, att, arrive_held_ms. `-25`~: neutral, overspeed, vz_cm_s, vz_warn, mask_ok, out_rpy, thr_slot_us, rc_tx |
+| `approach_params` / `approach_mode` | 요청 시 | 파라미터 전부 / mode, fc_mask, warning |
+| `authority` (`-25`~) | CH6 전환 시 | to(auto/manual), ch6, t, frame_age_ms(마지막 프레임 뒤 경과), tx_hz, out_rpy, thr_slot_us, pilot_rpy, pilot_valid, fc_rc, approach |
+| `warn` (`-25`~) | 1초 1회 | code:"vz", vz_cm_s, limit_cm_s, height_cm, height_src, throttle_action:"none" |
 | **`fc`** | 1Hz | status, armed, arming_flags(hex), blockers(아밍 차단 사유 이름), battery, vbat, cells, amps, motor[4], motor_ok, kill |
 | `kill` | 명령 시 | state(on/off) |
 | `fcmsp` | 질의 응답 | cmd, ok, error, size, hex (1초 안에 응답이 없으면 ok:false) |
@@ -152,5 +163,9 @@ python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --port /dev/cu.usbmodem
 | 빌드 | 바뀐 점 |
 |---|---|
 | `-19` | MSP v2 송수신. FC 상태 읽기(`MSP2_INAV_STATUS`의 아밍 플래그 32비트, `MSP2_INAV_ANALOG` 전압·전류·셀 수, `MSP_MOTOR`)와 `fc` 1Hz 메시지. `kill`(당시 ch8), `fcmsp` 진단 질의. 음성 명령에서 `fcmsp` 차단 |
-| `-20` | 킬 채널을 ch8 → **ch7**로. 새 FC 모드 배치(ch5 ARM, ch6 OVERRIDE, ch8 ANGLE)에 맞춤 — **현재 보드에 올라간 버전** |
-| `-21` | MTF-01P가 FC로 옮겨진 구성 대응: FC 거리센서 높이(`MSP_SONAR_ALTITUDE`) 10Hz 읽기, 높이 출처 표시. 카메라 팬·틸트 서보(D8·D9), 각도를 반영한 위치 계산, 카메라가 움직이는 동안 판단 보류, `cam` 명령, 음성 키워드 `cam_down`·`cam_front` — **작성 중 (빌드·시험 전)** |
+| `-20` | 킬 채널을 ch8 → **ch7**로. 새 FC 모드 배치(ch5 ARM, ch6 OVERRIDE, ch8 ANGLE)에 맞춤 |
+| `-21` | MTF-01P가 FC로 옮겨진 구성 대응: FC 거리센서 높이(`MSP_SONAR_ALTITUDE`) 10Hz 읽기, 높이 출처 표시. 카메라 팬·틸트 서보(D8·D9), 각도를 반영한 위치 계산, 카메라가 움직이는 동안 판단 보류, `cam` 명령, 음성 키워드 `cam_down`·`cam_front` |
+| `-23` | **접근 제어기** `approach.h`(AprilTag 저속 접근: 목표속도 ≤10cm/s, 감속·정지 반경, 가속 제한, 광류 속도 P, 안전 중지), 모드 `off/shadow/on/legacy`, `approach` 명령·JSON. **제어권** `rc_authority.h`(MSP_RC ch6로 AUTO/MANUAL 판정, 수동이면 출력 0). FC 광류(`MSP2_INAV_OPTICAL_FLOW`)·자세(`MSP_ATTITUDE`) 읽기. 호스트 테스트(`test/`) 추가 |
+| `-24` | SET_RAW_RC **스로틀 슬롯 1000 고정** — CH6 AUTO 전환 시 FC 스로틀이 1500으로 뛴다는 엔지니어 보고 대응(마스크에 스로틀 비트가 있을 때 1500이 들어가던 문제) |
+| `-25` | 엔지니어 요청 "수동 스로틀 유지형 수평 추적 시험": SET_RAW_RC **50Hz 상시 송신**(CH6 무관), 수동 중 조종기 스틱 추적 → AUTO 진입 시 **무충격 핸드오버**(기준점 고정 후 `handover_slew`로 1500 수렴), FC `rcmap`·`msp_override_channels` 읽어 스로틀 슬롯·마스크 검증(`mask`/`mask_unknown` fault), MTF vz 경고(기록만), deadband·태그 유실 중립, 과속 제동, `authority` 전환 이벤트. 상세: [`docs/2026-10-10-manual-throttle-tracking-test.md`](2026-10-10-manual-throttle-tracking-test.md) |
+| `-26` | **FC MSP 처리 한도 대응**: INAV는 포트당 초당 100명령만 처리하는데 -25는 152개를 보내 절반이 버려졌음(ack 55%). 질의 예산을 94/s로 조정, `ack_hz`/`rc_hz` 추가, `tag_monitor`에 "FC수신 NNHz" 표시 — **현재 보드에 올라간 버전** |
