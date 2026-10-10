@@ -16,6 +16,22 @@ uv run --with bleak --with pyserial python3 tools/tag_monitor.py --ble   # 블�
 - 스냅샷은 줄 사이에 끼어든 JSON을 걸러내고, base64 길이가 예상과 다르면 경고한다.
 - USB 포트를 열면 보드가 재부팅될 수 있다. 블루투스는 재부팅하지 않는다.
 
+- `fc`·`kill`·`fcmsp`·`gimbal` 메시지는 아직 한글로 풀어 주지 않고 JSON 원문으로 보인다.
+
+## FC 직접 점검 (2026-10-10)
+
+FC USB(VCP, macOS `/dev/cu.usbmodem3466324A35331`, "STM32 Virtual ComPort in FS Mode")나 보드를 거쳐 FC를 점검했다. 이때 쓴 스크립트는 임시 작업 폴더에 있고 저장소에는 아직 넣지 않았다.
+
+| 방법 | 쓰는 곳 | 주의 |
+|---|---|---|
+| FC USB **CLI** (`status`, `aux`, `get`, `set`, `save`) | 설정 읽기·변경 | CLI에 들어가면 재부팅 전까지 아밍이 막힌다. 끝나면 반드시 `save` 또는 `exit` |
+| FC USB **MSP** | 설정 확인(`MSP_MODE_RANGES` 34, `MSP2_COMMON_SETTING` 0x1003), 아밍 플래그(`MSP2_INAV_STATUS` 0x2000), 채널 값(`MSP_RC` 105) | 아밍에 영향 없음. 확인은 이 방법으로 |
+| 보드 `fcmsp <명령> [hex]` | FC USB 없이 블루투스로 질의·설정 | 예: `fcmsp 151`(센서 상태), `fcmsp 58`(거리센서 높이), `fcmsp 0x1003 <설정이름 hex + 00>` |
+| 킬 시험 (안내형) | 보드에 `kill`을 보내고 FC 상태를 계속 읽어 디스아밍까지의 과정을 기록 | ch6 보드 조종 → ARM 스위치 → 3초 뒤 자동 `kill` → `kill off` → ARM 스위치 내림 순서. 결과는 [07](07-fc-msp-integration.md) |
+
+- 설정 이름을 hex로 바꾸는 예: `python3 -c "print(b'motorstop_on_low\0'.hex())"`
+- FC 설정을 바꾸기 전에는 `diff all`을 `fc-info/`에 백업한다.
+
 ## 마이크 도구 (`tools/voice_tool.py`)
 
 [09](09-voice-mic.md)를 참고한다. `level`, `rec`, `collect`, `cmd` 기능이 있다.
@@ -57,9 +73,10 @@ python3 -m http.server 8000 -d sim    # Chrome에서 http://localhost:8000
 
 | 테스트 | 확인 내용 | 결과 |
 |---|---|---|
-| `msp_host_test.cpp` + `check_msp.py` | MSP 프레임 생성(헤더·체크섬·채널·리틀엔디언)을 규격대로 독립 해석, 응답 파서(잡음·체크섬 오류·FC 거부) | 통과 |
+| `msp_host_test.cpp` + `check_msp.py` | MSP 프레임 생성(헤더·체크섬·채널·리틀엔디언)을 규격대로 독립 해석, 응답 파서(잡음·체크섬 오류·FC 거부). 10-10: MSP v2 요청 CRC, 실제 MTF v2 프레임, v1·v2 섞인 흐름 추가 | 통과 |
 | `mtf_host_test.cpp` | 보드가 실제로 받은 MSP 모드 바이트로 MTF 파서, 플로우 단위 변환, Micolink 프레임 | 통과 (1709mm 해석) |
 | `adpcm_host_test.cpp` + `check_adpcm.py` | 보드 ADPCM 인코더 → Python 해독기 왕복 | SNR 32.2dB, 통과 |
+| `gimbal_host_test.cpp` (`-21`, 작성 예정) | 팬·틸트 광선 회전, 지면 교점, 바로 아래일 때 기존 식과 같은지, 펄스 범위 자르기 | — |
 
 ```bash
 cd tag-board-fw
