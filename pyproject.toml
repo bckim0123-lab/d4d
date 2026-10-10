@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d4d-planner"
+version = "0.1.0"
+description = "EMP/재밍 환경 드론용 사전 전장분석·코스계획 에이전트"
+requires-python = ">=3.10"
+dependencies = [
+  "pyserial>=3.5",
+  "fastapi>=0.110,<1",
+  "uvicorn>=0.29,<1",
+  "pillow>=10,<13",
+  "openai>=2,<3",
+]
+
+[project.optional-dependencies]
+bedrock = ["boto3>=1.35,<2"]
+dev = ["httpx>=0.27,<1"]
+
+[project.scripts]
+d4d-plan = "d4d_planner.cli:main"
+d4d-fc = "d4d_fc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

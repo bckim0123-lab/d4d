@@ -1,0 +1,30 @@
+{
+  "name": "demo_spider (스파이더 코드 네트워크: 재밍 구역 안 노드에서 데이터 회수)",
+  "link_policy": "continue_mission",
+  "field": { "width_m": 40, "height_m": 24, "resolution_m": 0.25 },
+  "start": { "x": 2, "y": 3 },
+  "objectives": [],
+  "goal": { "name": "지상국 착륙", "x": 2, "y": 3, "tolerance_m": 1.0 },
+  "tags": [
+    { "id": 1, "x": 5.9, "y": 10.1 },
+    { "id": 2, "x": 12.5, "y": 19.0, "role": "ble",     "payload_bytes": 32 },
+    { "id": 3, "x": 24.0, "y": 8.0,  "role": "ble",     "payload_bytes": 32 },
+    { "id": 4, "x": 31.0, "y": 19.5, "role": "mailbox", "payload_bytes": 16 },
+    { "id": 5, "x": 20.0, "y": 14.0 }
+  ],
+  "messages": [
+    { "name": "관측센서_로그",   "from": 2,       "to": "goal", "bytes": 4096, "priority": 1 },
+    { "name": "미션갱신_명령",   "from": "start", "to": 4,      "bytes": 256,  "priority": 2 },
+    { "name": "노드4_상태보고",  "from": 4,       "to": 3,      "bytes": 128,  "priority": 3 }
+  ],
+  "zones": [
+    { "kind": "obstacle", "name": "벽1", "shape": "rect", "x": 12, "y": 0, "w": 1, "h": 15 },
+    { "kind": "obstacle", "name": "벽2", "shape": "rect", "x": 26, "y": 9, "w": 1, "h": 15 },
+    { "kind": "obstacle", "name": "기둥1", "shape": "circle", "x": 19, "y": 12, "r": 1.2 },
+    { "kind": "obstacle", "name": "기둥2", "shape": "circle", "x": 33, "y": 11, "r": 1.5 },
+    { "kind": "jam", "name": "재밍 구역(노드2 포함)", "shape": "circle", "x": 12.5, "y": 19, "r": 4.5, "value": 1.0 },
+    { "kind": "jam", "name": "약한 재밍(노드3 포함)", "shape": "circle", "x": 24, "y": 8, "r": 3.0, "value": 0.4 },
+    { "kind": "low_flow", "name": "연기 구역", "shape": "rect", "x": 28, "y": 1, "w": 7, "h": 7, "value": 3.0 }
+  ],
+  "landing_sites": [ { "x": 2, "y": 20 } ]
+}

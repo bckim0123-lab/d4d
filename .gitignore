@@ -1,6 +1,17 @@
-﻿# PlatformIO 빌드 산출물·라이브러리 캐시 (빌드하면 다시 생긴다)
+# PlatformIO 빌드 산출물·라이브러리 캐시 (빌드하면 다시 생긴다)
 tag-board-fw/.pio/
-__pycache__/
 *.pyc
-.env
+
+out/
+# 블랙박스 원본은 수십 MB라 기본적으로 제외한다. 분석 대상 로그를 저장소에
+# 남기고 싶으면 해당 파일만 git add -f 로 강제 추가할 것.
+logs/
+# snapshots/ 는 의도적으로 추적한다. 케이블 없이 개발하려면 이 파일이 필요하다.
+__pycache__/
+*.egg-info/
 .venv/
+.env
+web/node_modules/
+web/dist/
+# 실행별 임무 산출물은 로컬 운용 기록이다. 안내 파일만 추적한다.
+artifacts/*/
