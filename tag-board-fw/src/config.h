@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 // 빌드 식별자 (부팅 메시지에 출력)
 // ---------------------------------------------------------------------------
-#define FW_BUILD "TAGVISION-20261010-21"
+#define FW_BUILD "TAGVISION-20261010-23"
 
 // ---------------------------------------------------------------------------
 // MTF-01P (115200 8N1, 100Hz) — Micolink·MSP(INAV 출력) 자동 구분. 기존 RIDER-SERIAL 펌웨어와 같은 핀
@@ -24,7 +24,7 @@
 #define FC_BAUD 115200          // INAV MSP 기본 속도
 #define MSP_ENABLED_DEFAULT true
 #define MSP_SEND_HZ 20          // INAV는 5Hz 이상을 요구 (docs/Rx.md)
-#define MSP_POLL_EVERY 4        // SET_RAW_RC 4번마다 MSP_RC 한 번 요청 → FC가 실제 받은 채널 확인
+#define MSP_POLL_EVERY 1        // 매 20Hz 주기 MSP_RC 요청 → 정상 응답 기준 CH6 전환을 약 50~100ms 안에 감지
 #define MSP_LINK_TIMEOUT_MS 1000
 #define MSP_CHANNELS 8          // 롤·피치·스로틀·요 + AUX 4개 (AUX는 INAV 마스크에 넣지 않으면 무시됨)
 
@@ -34,23 +34,44 @@
 #define MSP_CH_THROTTLE 2
 #define MSP_CH_YAW 3
 
+// FC가 돌려주는 MSP_RC는 ROLL·PITCH·YAW·THROTTLE·AUX 순서다(송신 AETR과 다름).
+#define FC_RC_CH_THROTTLE 3
+#define FC_RC_CH_ARM 4
+#define FC_RC_SAFE_MAX_US 1100
+
+// 제어권 스위치: FC MSP_RC의 CH6(인덱스 5)가 1000이면 AUTO, 2000이면 MANUAL.
+// INAV의 MSP RC OVERRIDE 활성 범위와 같은 900~1700만 AUTO이며 그 밖과 응답 누락은 MANUAL이다.
+#define MSP_CH_AUTHORITY 5
+#define MSP_AUTH_AUTO_MIN_US 900
+#define MSP_AUTH_AUTO_MAX_US 1700
+#define MSP_AUTH_TIMEOUT_MS 250
+
 // 킬(정지) 채널: 보드가 이 채널을 KILL_ON_US로 보내면 INAV FAILSAFE 모드(DROP)가 켜져 즉시 디스아밍된다.
 // 20261010 FC 설정 기준: ch5=ARM, ch6=MSP RC OVERRIDE(900~1700, 스위치 올림), ch8=ANGLE(항상).
-// 그래서 킬은 ch7(인덱스 6). INAV 설정 필요: aux 3 27 2 1700 2100 / set msp_override_channels = 64
-// 보드 조종(ch6 올림)이 켜져 있을 때만 동작한다. 보드는 끌 수만 있고 아밍은 못 한다.
+// 그래서 킬은 ch7(인덱스 6). INAV 설정 필요: aux 3 27 2 1700 2100 / set msp_override_channels = 67
+// 67은 롤(1)+피치(2)+킬 ch7(64)이며, 보드는 끌 수만 있고 아밍은 못 한다.
 #define MSP_CH_KILL 6
 #define KILL_ON_US 2000
 #define KILL_OFF_US 1000
 
 // FC 상태 읽기: 20Hz 주기 중 이 간격마다 상태·배터리·모터 출력을 번갈아 요청 (각 2Hz)
 #define FC_POLL_PERIOD 10
+#define FC_STATUS_SAFE_TIMEOUT_MS 1000  // 모터 시험은 이보다 오래된 아밍 상태로 시작·지속하지 않음
 
 // 높이: 20261010부터 MTF-01P는 FC UART4에 연결한다(INAV rangefinder·opflow = MSP).
 // 보드에 MTF-01P 데이터가 직접 들어오지 않으면 FC의 거리센서 값(MSP_SONAR_ALTITUDE, cm)을 대신 쓴다.
 // 20Hz 주기 중 이 간격마다 한 번 요청 → 2 = 10Hz
 #define FC_ALT_POLL_EVERY 2
 
-// 착륙 지점 오프셋(cm) → 스틱 값(µs). 1500 중립에서 ±만큼 움직인다.
+// 접근 제어 (src/approach.h): 광류·자세를 FC에서 읽는 주기 (20Hz 주기 중 간격)
+#define FC_FLOW_POLL_EVERY 1    // MSP2_INAV_OPTICAL_FLOW 20Hz
+#define FC_ATT_POLL_EVERY 2     // MSP_ATTITUDE 10Hz
+// 부팅 시 접근 제어 모드: 0 off · 1 shadow(계산·로그만, FC에는 중립) · 2 on · 3 legacy(아래 4µs/cm 위치 제어)
+// 검증 전에는 shadow 로 올린다. `approach on|shadow|legacy|off`로 바꾼다.
+#define APPROACH_MODE_DEFAULT 1
+#define APPROACH_REPORT_EVERY 4 // approach JSON 5Hz
+
+// 착륙 지점 오프셋(cm) → 스틱 값(µs). 1500 중립에서 ±만큼 움직인다. (approach legacy 모드에서만 사용)
 // INAV 쪽 비행 모드에 따라 의미가 다르다: ANGLE은 기울기, POSHOLD는 속도 명령.
 #define CTRL_XY_US_PER_CM 4.0f  // 1cm 벗어나면 4µs
 #define CTRL_XY_MAX_US 80       // 최대 ±80µs (전체 ±500의 16%)

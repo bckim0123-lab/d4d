@@ -151,9 +151,15 @@ def fmt_target(o):
 def fmt_flow(o):
     if not o.get("connected"):
         return "[MTF-01P] 연결 안 됨 (데이터 없음)"
+    def num(key, fmt):
+        v = o.get(key)
+        return format(v, fmt) if isinstance(v, (int, float)) else "-"
+
+    # 높이 출처가 FC(MSP_SONAR_ALTITUDE)이면 속도 필드는 null 로 온다
     return (
-        f"[MTF-01P] 높이 {o['height_cm']:.1f}cm | 앞 {o['forward_cm_s']:+.1f} · 오른쪽 {o['right_cm_s']:+.1f}"
-        f" · 위 {o['up_cm_s']:+.1f} cm/s | 품질 {o['quality']} | 패킷 {o['packets']} 오류 {o['errors']}"
+        f"[MTF-01P] 높이 {num('height_cm', '.1f')}cm | 앞 {num('forward_cm_s', '+.1f')} · 오른쪽 {num('right_cm_s', '+.1f')}"
+        f" · 위 {num('up_cm_s', '+.1f')} cm/s | 품질 {o.get('quality')} | 패킷 {o.get('packets')} 오류 {o.get('errors')}"
+        f" | 출처 {o.get('height_src', '?')}"
     )
 
 
@@ -177,10 +183,19 @@ PHASE_KO = {
 
 
 def fmt_msp(o):
-    if not o["enabled"]:
-        return "[MSP→FC] 송신 꺼짐 (msp on 으로 켜기) — INAV는 조종기 입력 사용"
+    authority = o.get("authority", "unknown")
+    ch6 = o.get("ch6")
+    rc_tx = o.get("rc_tx", bool(o.get("out")))
+    authority_text = (
+        f"{'AUTO' if authority == 'auto' else 'MANUAL'}"
+        f"(CH6={ch6 if ch6 is not None else '없음'})"
+        if authority in ("auto", "manual")
+        else "UNKNOWN"
+    )
+    if not o["enabled"] and not rc_tx:
+        return f"[MSP→FC] 제어권 {authority_text} · 자율 송신 꺼짐 (msp on 으로 켜기)"
     names = ["롤", "피치", "스로틀", "요"]
-    out = " ".join(f"{n}={v}" for n, v in zip(names, o["out"]))
+    out = " ".join(f"{n}={v}" for n, v in zip(names, o.get("out", []))) if rc_tx else "정지"
     link = "FC 응답 OK" if o["fc_link"] else "FC 응답 없음(배선·INAV Ports MSP 확인)"
     fc = ""
     if o["fc_rc"]:
@@ -188,7 +203,8 @@ def fmt_msp(o):
         fc_names = ["롤", "피치", "요", "스로틀", "AUX1", "AUX2", "AUX3", "AUX4"]
         fc = " | FC가 쓰는 값: " + " ".join(f"{n}={v}" for n, v in zip(fc_names, o["fc_rc"]))
     thr = "" if o["throttle_ctrl"] else " (스로틀 제어 꺼짐)"
-    return (f"[MSP→FC] {link} · 보냄 {o['sent']} 응답 {o['acks']} 오류 {o['errors']} | 송신: {out}{thr}{fc}"
+    return (f"[MSP→FC] {link} · 제어권 {authority_text} · RC 송신 {'중' if rc_tx else '정지'}"
+            f" · 보냄 {o['sent']} 응답 {o['acks']} 오류 {o['errors']} | 송신: {out}{thr}{fc}"
             f" | 단계 {PHASE_KO.get(o['phase'], o['phase'])}")
 
 

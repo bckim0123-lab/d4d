@@ -23,12 +23,14 @@
 #include "common/zarray.h"
 #include "common/homography.h"
 
+#include "approach.h"
 #include "ble_link.h"
 #include "config.h"
 #include "gimbal.h"
 #include "msp.h"
 #include "mic.h"
 #include "mtf01p.h"
+#include "rc_authority.h"
 
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
@@ -483,6 +485,9 @@ struct CtrlState {
   bool centered = false;
   int phase = PH_ALIGN;
   uint32_t holdMs = 0;    // 50cm 유지 누적 시간
+  // 태그 위치 미분으로 구한 기체 속도 (cm/s, + = 기체가 오른쪽/앞으로 이동). 광류 교차 확인용, 3~4Hz
+  bool tagVelValid = false;
+  float tagVelRight = 0, tagVelFwd = 0;
 };
 static CtrlState g_ctrl;
 static portMUX_TYPE g_ctrlMux = portMUX_INITIALIZER_UNLOCKED;
@@ -501,9 +506,20 @@ static bool inBand(const FlowState &f, float targetCm) {
 // 태그를 놓치면 단계는 그대로 두고 진행하지 않는다 (명령은 MSP 태스크에서 중립)
 static void updateMission(const TagObs *t, const FlowState &f, uint32_t dtMs) {
   CtrlState c = ctrlSnapshot();
+  bool wasSeen = c.seen;
   c.seen = t != nullptr;
   if (t) {
-    c.atMs = millis();
+    uint32_t now = millis();
+    // 목표가 기체 기준으로 오른쪽으로 움직였다 = 기체가 왼쪽으로 이동했다 → 부호 반전
+    if (wasSeen && c.atMs && now > c.atMs && now - c.atMs < 1000) {
+      float dt = (now - c.atMs) / 1000.0f;
+      c.tagVelRight = -(t->bodyRight - c.bodyRight) / dt;
+      c.tagVelFwd = -(t->bodyFwd - c.bodyFwd) / dt;
+      c.tagVelValid = true;
+    } else {
+      c.tagVelValid = false;
+    }
+    c.atMs = now;
     c.bodyRight = t->bodyRight;
     c.bodyFwd = t->bodyFwd;
     c.centered = t->centered;
@@ -531,6 +547,8 @@ static void updateMission(const TagObs *t, const FlowState &f, uint32_t dtMs) {
       default:
         break;
     }
+  } else {
+    c.tagVelValid = false;
   }
   portENTER_CRITICAL(&g_ctrlMux);
   g_ctrl = c;
@@ -611,12 +629,47 @@ static void reportTarget(const TagObs &o, int candidates, uint32_t frameMs, cons
 struct MspStats {
   uint32_t sent = 0, acks = 0, rcReplies = 0, errors = 0, motorAcks = 0;
   uint32_t lastRxMs = 0;
+  uint32_t lastRawRcTxMs = 0;
+  bool rawRcTxActive = false;
+  bool lastRawRcKill = false;
   uint16_t out[MSP_CHANNELS] = {};
   uint16_t fcRc[MSP_CHANNELS] = {};
   uint8_t fcRcCount = 0;
 };
 static MspStats g_msp;
 static portMUX_TYPE g_mspMux = portMUX_INITIALIZER_UNLOCKED;
+static RcAuthorityGate g_rcAuthority(MSP_CH_AUTHORITY, MSP_AUTH_AUTO_MIN_US, MSP_AUTH_AUTO_MAX_US,
+                                     MSP_AUTH_TIMEOUT_MS);
+
+struct RcAuthoritySnapshot {
+  bool fresh;
+  bool automatic;
+  uint16_t channelUs;
+  bool armSwitchDisarmed;
+  bool throttleLow;
+  uint16_t armSwitchUs;
+  uint16_t throttleUs;
+};
+
+static RcAuthoritySnapshot rcAuthoritySnapshot(uint32_t nowMs) {
+  portENTER_CRITICAL(&g_mspMux);
+  g_rcAuthority.expire(nowMs);
+  bool fresh = g_rcAuthority.fresh(nowMs);
+  bool haveSafetyChannels = fresh && g_msp.fcRcCount > FC_RC_CH_ARM;
+  uint16_t armUs = haveSafetyChannels ? g_msp.fcRc[FC_RC_CH_ARM] : 0;
+  uint16_t throttleUs = haveSafetyChannels ? g_msp.fcRc[FC_RC_CH_THROTTLE] : 0;
+  RcAuthoritySnapshot s = {
+    fresh,
+    g_rcAuthority.authority(nowMs) == RcAuthority::Auto,
+    g_rcAuthority.channelUs(),
+    haveSafetyChannels && armUs >= 750 && armUs <= FC_RC_SAFE_MAX_US,
+    haveSafetyChannels && throttleUs >= 750 && throttleUs <= FC_RC_SAFE_MAX_US,
+    armUs,
+    throttleUs,
+  };
+  portEXIT_CRITICAL(&g_mspMux);
+  return s;
+}
 
 // FC 상태 (MSP2_INAV_STATUS · MSP2_INAV_ANALOG · MSP_MOTOR)
 struct FcStatus {
@@ -630,6 +683,21 @@ struct FcStatus {
   uint32_t motorAtMs = 0;
 };
 static FcStatus g_fc;
+
+// FC 광류·자세 (접근 제어 입력). MTF-01P는 FC UART4에 있으므로 속도는 FC 값으로 추정한다.
+struct FcFlow {
+  uint8_t quality = 0;
+  int16_t flowX = 0, flowY = 0;  // °/s (INAV 가 정렬·보정한 뒤의 값)
+  int16_t bodyX = 0, bodyY = 0;  // 자이로 °/s
+  uint32_t atMs = 0;
+};
+struct FcAttitude {
+  int16_t rollDeci = 0, pitchDeci = 0;  // 0.1°
+  int16_t yawDeg = 0;
+  uint32_t atMs = 0;
+};
+static FcFlow g_fcFlow;
+static FcAttitude g_fcAtt;
 
 // INAV runtime_config.h armingFlag_e (bit → 이름)
 static const struct { uint8_t bit; const char *name; } ARMING_BLOCKERS[] = {
@@ -655,11 +723,44 @@ struct FcQuery {
 };
 static FcQuery g_query;
 static portMUX_TYPE g_queryMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool g_kill = false;
+
+struct ControlFlags {
+  bool mspEnabled;
+  bool kill;
+  uint8_t killReleaseFrames;
+};
+static ControlFlags g_control = {MSP_ENABLED_DEFAULT, false, 0};
+static portMUX_TYPE g_controlMux = portMUX_INITIALIZER_UNLOCKED;
+
+static ControlFlags controlFlagsSnapshot() {
+  portENTER_CRITICAL(&g_controlMux);
+  ControlFlags flags = g_control;
+  portEXIT_CRITICAL(&g_controlMux);
+  return flags;
+}
+
+static void setMspEnabled(bool enabled) {
+  portENTER_CRITICAL(&g_controlMux);
+  g_control.mspEnabled = enabled;
+  portEXIT_CRITICAL(&g_controlMux);
+}
+
+static void setKill(bool kill) {
+  portENTER_CRITICAL(&g_controlMux);
+  if (!kill && g_control.kill) g_control.killReleaseFrames = 10;
+  g_control.kill = kill;
+  if (kill) g_control.killReleaseFrames = 0;
+  portEXIT_CRITICAL(&g_controlMux);
+}
+
+static void consumeKillReleaseFrame() {
+  portENTER_CRITICAL(&g_controlMux);
+  if (g_control.killReleaseFrames) g_control.killReleaseFrames--;
+  portEXIT_CRITICAL(&g_controlMux);
+}
 
 static inline uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
 static inline uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
-static volatile bool g_mspEnabled = MSP_ENABLED_DEFAULT;
 
 static void handleMspReply(const MspReply &r) {
   portENTER_CRITICAL(&g_mspMux);
@@ -676,6 +777,7 @@ static void handleMspReply(const MspReply &r) {
       uint8_t n = min<uint16_t>(r.size / 2, MSP_CHANNELS);
       for (uint8_t i = 0; i < n; i++) g_msp.fcRc[i] = r.payload[2 * i] | (r.payload[2 * i + 1] << 8);
       g_msp.fcRcCount = n;
+      g_rcAuthority.observe(g_msp.fcRc, n, millis());
     } else if (r.cmd == MSP2_INAV_STATUS && r.size >= 13) {
       g_fc.armingFlags = rd32(r.payload + 9);  // cycle·i2c·sensors·load(각 u16) + profiles(u8) 다음
       g_fc.statusAtMs = millis();
@@ -690,6 +792,18 @@ static void handleMspReply(const MspReply &r) {
     } else if (r.cmd == MSP_SONAR_ALTITUDE && r.size >= 4) {
       g_fcAltCm = (int32_t)rd32(r.payload);
       g_fcAltAtMs = millis();
+    } else if (r.cmd == MSP2_INAV_OPTICAL_FLOW && r.size >= 9) {
+      g_fcFlow.quality = r.payload[0];
+      g_fcFlow.flowX = (int16_t)rd16(r.payload + 1);
+      g_fcFlow.flowY = (int16_t)rd16(r.payload + 3);
+      g_fcFlow.bodyX = (int16_t)rd16(r.payload + 5);
+      g_fcFlow.bodyY = (int16_t)rd16(r.payload + 7);
+      g_fcFlow.atMs = millis();
+    } else if (r.cmd == MSP_ATTITUDE && r.size >= 6) {
+      g_fcAtt.rollDeci = (int16_t)rd16(r.payload);
+      g_fcAtt.pitchDeci = (int16_t)rd16(r.payload + 2);
+      g_fcAtt.yawDeg = (int16_t)rd16(r.payload + 4);
+      g_fcAtt.atMs = millis();
     }
   }
   portEXIT_CRITICAL(&g_mspMux);
@@ -709,13 +823,154 @@ static uint16_t stick(float us, int maxUs) {
   return (uint16_t)lroundf(1500.0f + v);
 }
 
-// 판단 → 스틱 값. 태그가 안 보이거나 판단이 오래되면 중립(1500).
-// allowThrottle: 실제 FC로는 CTRL_THROTTLE_ENABLED일 때만, 시뮬레이터로는 항상 허용한다.
-static void computeSticks(uint16_t ch[MSP_CHANNELS], bool allowThrottle) {
-  for (int i = 0; i < MSP_CHANNELS; i++) ch[i] = 1500;
-  ch[MSP_CH_KILL] = g_kill ? KILL_ON_US : KILL_OFF_US;  // 태그·판단과 무관하게 항상
+// ---------------------------------------------------------------------------
+// 접근 제어 (src/approach.h). mspTask 가 20Hz 로 step 하고, computeSticks 가 결과를 쓴다.
+// 모드: off(계산 안 함) · shadow(계산·로그만, FC에는 중립) · on(FC로 출력) · legacy(기존 4µs/cm 위치 제어)
+// ---------------------------------------------------------------------------
+enum ApproachMode { APM_OFF = 0, APM_SHADOW = 1, APM_ON = 2, APM_LEGACY = 3 };
+static const char *APPROACH_MODE_NAME[] = {"off", "shadow", "on", "legacy"};
+static volatile int g_approachMode = APPROACH_MODE_DEFAULT;
+static ApproachController g_approach;
+static ApproachInput g_approachIn;    // 마지막 입력 (로그용)
+static ApproachOutput g_approachOut;  // 마지막 출력
+static uint32_t g_approachStepMs = 0;
+static float g_approachTagVelR = 0, g_approachTagVelF = 0;
+static bool g_approachTagVelValid = false;
+static portMUX_TYPE g_approachMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void approachStep(const RcAuthoritySnapshot &authority, const ControlFlags &flags, float dtS) {
+  uint32_t now = millis();
   CtrlState c = ctrlSnapshot();
   FlowState f = flowSnapshot();
+  FcFlow fl;
+  FcAttitude att;
+  portENTER_CRITICAL(&g_mspMux);
+  fl = g_fcFlow;
+  att = g_fcAtt;
+  portEXIT_CRITICAL(&g_mspMux);
+
+  portENTER_CRITICAL(&g_approachMux);
+  ApproachParams p = g_approach.p;
+  portEXIT_CRITICAL(&g_approachMux);
+
+  ApproachInput in;
+  in.nowMs = now;
+  in.enabled = g_approachMode == APM_ON || g_approachMode == APM_SHADOW;
+  in.authorityAuto = authority.automatic;
+  in.kill = flags.kill;
+
+  bool hv = heightValid(f);
+  float hCm = hv ? f.s.distance_mm / 10.0f : 0.0f;
+  in.heightValid = hv;
+  in.heightAtMs = f.lastRxMs;
+  in.heightCm = hCm;
+
+  // 위치 오차: 카메라 → 무게중심 오프셋, 선택적으로 기체 기울기 보정 (부호는 실측으로 확정)
+  in.tagValid = c.seen && c.atMs != 0;
+  in.tagAtMs = c.atMs;
+  float errR = c.bodyRight + p.camOffsetRightCm;
+  float errF = c.bodyFwd + p.camOffsetFwdCm;
+  bool attFresh = att.atMs && (now - att.atMs) < 300;
+  if (p.attComp != 0 && attFresh && hv) {
+    float roll = att.rollDeci * 0.1f * (float)M_PI / 180.0f;
+    float pitch = att.pitchDeci * 0.1f * (float)M_PI / 180.0f;
+    errR -= p.attRollSign * hCm * tanf(roll);
+    errF -= p.attPitchSign * hCm * tanf(pitch);
+  }
+  in.errRightCm = errR;
+  in.errFwdCm = errF;
+
+  // 속도 추정: (유량 − 자이로)[rad/s] × 높이[cm]. 축 대응·부호는 파라미터 (실측 전)
+  bool flowFresh = fl.atMs && (now - fl.atMs) < p.flowStaleMs;
+  in.velValid = flowFresh && hv;
+  in.velAtMs = fl.atMs;
+  in.flowQuality = fl.quality;
+  if (in.velValid) {
+    float rateA = (fl.flowX - fl.bodyX) * (float)M_PI / 180.0f;
+    float rateB = (fl.flowY - fl.bodyY) * (float)M_PI / 180.0f;
+    float fwdRate = p.flowSwapXY != 0 ? rateB : rateA;
+    float rightRate = p.flowSwapXY != 0 ? rateA : rateB;
+    in.velFwdCmS = p.flowFwdSign * fwdRate * hCm;
+    in.velRightCmS = p.flowRightSign * rightRate * hCm;
+  }
+
+  ApproachOutput out = g_approach.step(in, dtS);
+  portENTER_CRITICAL(&g_approachMux);
+  g_approachIn = in;
+  g_approachOut = out;
+  g_approachStepMs = now;
+  g_approachTagVelR = c.tagVelRight;
+  g_approachTagVelF = c.tagVelFwd;
+  g_approachTagVelValid = c.tagVelValid;
+  portEXIT_CRITICAL(&g_approachMux);
+}
+
+// 요구 11: 거리, 오차 X/Y, 목표속도, 추정속도, 롤/피치 명령, 태그 상태, CH6 모드, 오류 상태
+static void emitApproach(const RcAuthoritySnapshot &authority) {
+  ApproachInput in;
+  ApproachOutput out;
+  float tvR, tvF;
+  bool tvValid;
+  int mode = g_approachMode;
+  portENTER_CRITICAL(&g_approachMux);
+  in = g_approachIn;
+  out = g_approachOut;
+  tvR = g_approachTagVelR;
+  tvF = g_approachTagVelF;
+  tvValid = g_approachTagVelValid;
+  portEXIT_CRITICAL(&g_approachMux);
+  FcAttitude att;
+  portENTER_CRITICAL(&g_mspMux);
+  att = g_fcAtt;
+  portEXIT_CRITICAL(&g_mspMux);
+  uint32_t now = millis();
+  bool tagFresh = in.tagValid && (now - in.tagAtMs) <= g_approach.p.tagStaleMs;
+  char tagVel[48] = "null,null";
+  if (tvValid) snprintf(tagVel, sizeof(tagVel), "%.1f,%.1f", tvR, tvF);
+  char att_s[40] = "null,null";
+  if (att.atMs && now - att.atMs < 500) snprintf(att_s, sizeof(att_s), "%.1f,%.1f", att.rollDeci * 0.1f, att.pitchDeci * 0.1f);
+  char line[700];
+  snprintf(line, sizeof(line),
+           "{\"type\":\"approach\",\"mode\":\"%s\",\"state\":\"%s\",\"fault\":%s%s%s,\"dist_cm\":%.1f,"
+           "\"err_right_cm\":%.1f,\"err_fwd_cm\":%.1f,\"target_speed\":%.1f,\"v_target\":[%.1f,%.1f],"
+           "\"v_flow\":[%.1f,%.1f],\"v_flow_valid\":%s,\"flow_q\":%u,\"v_tag\":[%s],\"roll_us\":%.1f,"
+           "\"pitch_us\":%.1f,\"tag\":\"%s\",\"authority\":\"%s\",\"ch6\":%u,\"height_cm\":%.1f,"
+           "\"height_valid\":%s,\"att\":[%s],\"arrive_held_ms\":%lu}",
+           APPROACH_MODE_NAME[mode & 3], approachStateName(out.state), out.fault ? "\"" : "",
+           out.fault ? out.fault : "null", out.fault ? "\"" : "", out.distCm, in.errRightCm, in.errFwdCm,
+           out.targetSpeedCmS, out.vTargetRightCmS, out.vTargetFwdCmS, in.velRightCmS, in.velFwdCmS,
+           in.velValid ? "true" : "false", in.flowQuality, tagVel, out.rollUs, out.pitchUs,
+           tagFresh ? "fresh" : (in.tagValid ? "stale" : "none"), authority.automatic ? "auto" : "manual",
+           authority.channelUs, in.heightCm, in.heightValid ? "true" : "false", att_s,
+           (unsigned long)out.arriveHeldMs);
+  emitLine(line);
+}
+
+// 판단 → 스틱 값. 태그가 안 보이거나 판단이 오래되면 중립(1500).
+// allowThrottle: 실제 FC로는 CTRL_THROTTLE_ENABLED일 때만, 시뮬레이터로는 항상 허용한다.
+static void computeSticks(uint16_t ch[MSP_CHANNELS], bool allowThrottle, bool kill) {
+  for (int i = 0; i < MSP_CHANNELS; i++) ch[i] = 1500;
+  ch[MSP_CH_KILL] = kill ? KILL_ON_US : KILL_OFF_US;  // 태그·판단과 무관하게 항상
+  CtrlState c = ctrlSnapshot();
+  FlowState f = flowSnapshot();
+  int mode = g_approachMode;
+
+  if (mode == APM_ON) {
+    // 접근 제어 출력. step 이 최근(2주기 안)에 돌았을 때만 — 아니면 중립
+    ApproachOutput out;
+    uint32_t stepMs;
+    portENTER_CRITICAL(&g_approachMux);
+    out = g_approachOut;
+    stepMs = g_approachStepMs;
+    portEXIT_CRITICAL(&g_approachMux);
+    if (stepMs && (millis() - stepMs) < (2000 / MSP_SEND_HZ)) {
+      ch[MSP_CH_ROLL] = stick(out.rollUs, (int)g_approach.p.cmdMaxUs);
+      ch[MSP_CH_PITCH] = stick(out.pitchUs, (int)g_approach.p.cmdMaxUs);
+    }
+    return;  // 접근 제어는 수평만. 스로틀은 보내지 않는다
+  }
+  if (mode != APM_LEGACY) return;  // off·shadow: 롤·피치 중립
+
   bool fresh = c.seen && (millis() - c.atMs) < CTRL_TARGET_STALE_MS;
   if (!fresh) return;
 
@@ -735,20 +990,35 @@ static void emitMspStatus() {
   portENTER_CRITICAL(&g_mspMux);
   m = g_msp;
   portEXIT_CRITICAL(&g_mspMux);
+  uint32_t now = millis();
+  RcAuthoritySnapshot authority = rcAuthoritySnapshot(now);
+  ControlFlags flags = controlFlagsSnapshot();
   CtrlState c = ctrlSnapshot();
-  bool link = m.lastRxMs && (millis() - m.lastRxMs) < MSP_LINK_TIMEOUT_MS;
-  char out[64] = "", rc[64] = "";
+  bool link = m.lastRxMs && (now - m.lastRxMs) < MSP_LINK_TIMEOUT_MS;
+  bool rcTx = m.rawRcTxActive;
+  bool killTx = rcTx && m.lastRawRcKill;
+  char out[64] = "", rc[64] = "", ch5[8] = "null", ch6[8] = "null", throttle[8] = "null";
+  if (authority.fresh) {
+    snprintf(ch5, sizeof(ch5), "%u", authority.armSwitchUs);
+    snprintf(ch6, sizeof(ch6), "%u", authority.channelUs);
+    snprintf(throttle, sizeof(throttle), "%u", authority.throttleUs);
+  }
   size_t n = 0;
-  for (int i = 0; g_mspEnabled && i < MSP_CHANNELS; i++) n += snprintf(out + n, sizeof(out) - n, "%s%u", i ? "," : "", m.out[i]);
+  for (int i = 0; rcTx && i < MSP_CHANNELS; i++) n += snprintf(out + n, sizeof(out) - n, "%s%u", i ? "," : "", m.out[i]);
   n = 0;
   for (int i = 0; link && i < m.fcRcCount; i++) n += snprintf(rc + n, sizeof(rc) - n, "%s%u", i ? "," : "", m.fcRc[i]);
-  char line[400];
+  char line[560];
   snprintf(line, sizeof(line),
            "{\"type\":\"msp\",\"enabled\":%s,\"fc_link\":%s,\"sent\":%lu,\"acks\":%lu,\"rc_replies\":%lu,"
-           "\"errors\":%lu,\"out\":[%s],\"fc_rc\":[%s],\"phase\":\"%s\",\"throttle_ctrl\":%s,\"kill\":%s}",
-           g_mspEnabled ? "true" : "false", link ? "true" : "false", (unsigned long)m.sent, (unsigned long)m.acks,
-           (unsigned long)m.rcReplies, (unsigned long)m.errors, out, rc, PHASE_CODE[c.phase],
-           CTRL_THROTTLE_ENABLED ? "true" : "false", g_kill ? "true" : "false");
+           "\"errors\":%lu,\"out\":[%s],\"fc_rc\":[%s],\"authority\":\"%s\",\"authority_fresh\":%s,"
+           "\"ch5\":%s,\"ch6\":%s,\"rc_throttle\":%s,\"rc_tx\":%s,\"phase\":\"%s\",\"throttle_ctrl\":%s,"
+           "\"kill\":%s,\"kill_tx\":%s}",
+           flags.mspEnabled ? "true" : "false", link ? "true" : "false", (unsigned long)m.sent, (unsigned long)m.acks,
+           (unsigned long)m.rcReplies, (unsigned long)m.errors, out, rc,
+           authority.automatic ? "auto" : "manual", authority.fresh ? "true" : "false",
+           ch5, ch6, throttle, rcTx ? "true" : "false", PHASE_CODE[c.phase],
+           CTRL_THROTTLE_ENABLED ? "true" : "false", flags.kill ? "true" : "false",
+           killTx ? "true" : "false");
   emitLine(line);
 }
 
@@ -762,6 +1032,7 @@ static void emitFcStatus() {
   bool st = f.statusAtMs && now - f.statusAtMs < 2000;
   bool an = f.analogAtMs && now - f.analogAtMs < 2000;
   bool mo = f.motorAtMs && now - f.motorAtMs < 2000;
+  ControlFlags flags = controlFlagsSnapshot();
   char blockers[260] = "";
   size_t n = 0;
   for (const auto &b : ARMING_BLOCKERS)
@@ -775,7 +1046,7 @@ static void emitFcStatus() {
            st ? "true" : "false", (st && (f.armingFlags & ARMED_FLAG)) ? "true" : "false",
            (unsigned long)f.armingFlags, blockers, an ? "true" : "false", f.vbatCv / 100.0f, f.cells,
            f.ampsCa / 100.0f, f.motor[0], f.motor[1], f.motor[2], f.motor[3], mo ? "true" : "false",
-           g_kill ? "true" : "false");
+           flags.kill ? "true" : "false");
   emitLine(line);
 }
 
@@ -818,9 +1089,17 @@ struct MotorTest {
   uint32_t untilMs = 0;
   uint8_t stopFrames = 0;  // 남은 정지 프레임 수
   uint32_t ackStart = 0;
+  uint32_t generation = 0; // 다른 코어의 중지 요청 뒤 오래된 RUN 결정을 폐기
 };
 static MotorTest g_motor;
 static portMUX_TYPE g_motorMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool motorCommandBusy() {
+  portENTER_CRITICAL(&g_motorMux);
+  bool busy = g_motor.active || g_motor.stopFrames != 0;
+  portEXIT_CRITICAL(&g_motorMux);
+  return busy;
+}
 
 static bool fcLinkAlive() {
   portENTER_CRITICAL(&g_mspMux);
@@ -829,45 +1108,109 @@ static bool fcLinkAlive() {
   return last && (millis() - last) < MSP_LINK_TIMEOUT_MS;
 }
 
-static void sendMotorFrame(uint8_t mask, uint16_t value) {
+static bool sendMotorFrame(uint8_t mask, uint16_t value) {
   uint8_t payload[16], frame[6 + 16];
   for (int i = 0; i < 8; i++) {
     uint16_t v = (i < MOTOR_COUNT && (mask & (1 << i))) ? value : 1000;
     payload[2 * i] = v & 0xFF;
     payload[2 * i + 1] = v >> 8;
   }
-  Serial2.write(frame, mspEncode(MSP_SET_MOTOR, payload, sizeof(payload), frame));
+  size_t frameLen = mspEncode(MSP_SET_MOTOR, payload, sizeof(payload), frame);
+  return Serial2.write(frame, frameLen) == frameLen;
 }
 
 static void motorTestStep() {
+  uint32_t now = millis();
+  RcAuthoritySnapshot authority = rcAuthoritySnapshot(now);
+  ControlFlags flags = controlFlagsSnapshot();
+  portENTER_CRITICAL(&g_mspMux);
+  FcStatus fc = g_fc;
+  portEXIT_CRITICAL(&g_mspMux);
+  bool fcStatusFresh = fc.statusAtMs && (now - fc.statusAtMs) <= FC_STATUS_SAFE_TIMEOUT_MS;
+  bool armed = fcStatusFresh && (fc.armingFlags & ARMED_FLAG);
+  const char *abortReason = !authority.automatic ? "manual_authority"
+                            : flags.kill         ? "kill"
+                            : !authority.armSwitchDisarmed ? "arm_switch"
+                            : !authority.throttleLow       ? "throttle"
+                            : !fcStatusFresh     ? "fc_status_stale"
+                            : armed              ? "fc_armed"
+                                                 : nullptr;
+
+  enum Action { NONE, RUN, STOP } action = NONE;
+  uint8_t mask = 0;
+  uint16_t value = 1000;
+  uint32_t ackStart = 0;
+  uint32_t generation = 0;
+  bool aborted = false;
+  bool stopped = false;
+
   portENTER_CRITICAL(&g_motorMux);
-  MotorTest m = g_motor;
-  portEXIT_CRITICAL(&g_motorMux);
-  if (m.active) {
-    if ((int32_t)(millis() - m.untilMs) < 0) {
-      sendMotorFrame(m.mask, m.value);
-      return;
+  if (g_motor.active) {
+    if (abortReason || (int32_t)(now - g_motor.untilMs) >= 0) {
+      aborted = abortReason != nullptr;
+      g_motor.active = false;
+      g_motor.stopFrames = 10;  // 종료·권한 상실 → 정지 신호를 0.5초 동안 반복
+      g_motor.generation++;
+    } else {
+      action = RUN;
+      mask = g_motor.mask;
+      value = g_motor.value;
     }
-    portENTER_CRITICAL(&g_motorMux);
-    g_motor.active = false;
-    g_motor.stopFrames = 10;  // 시간 종료 → 정지 신호를 0.5초 동안 반복
-    portEXIT_CRITICAL(&g_motorMux);
-    m.stopFrames = 10;
   }
-  if (m.stopFrames) {
-    sendMotorFrame(0, 1000);
+  if (action == NONE && g_motor.stopFrames) {
+    action = STOP;
+  }
+  ackStart = g_motor.ackStart;
+  generation = g_motor.generation;
+  portEXIT_CRITICAL(&g_motorMux);
+
+  if (action == RUN) {
     portENTER_CRITICAL(&g_motorMux);
-    bool last = --g_motor.stopFrames == 0;
+    bool stillCurrent = g_motor.active && g_motor.generation == generation;
+    bool stopRequested = !stillCurrent && g_motor.stopFrames != 0;
     portEXIT_CRITICAL(&g_motorMux);
-    if (last) {
-      char line[120];
-      portENTER_CRITICAL(&g_mspMux);
-      uint32_t acks = g_msp.motorAcks;
-      portEXIT_CRITICAL(&g_mspMux);
-      snprintf(line, sizeof(line), "{\"type\":\"motortest\",\"state\":\"stopped\",\"fc_acks\":%lu}",
-               (unsigned long)(acks - m.ackStart));
-      emitLine(line);
+    if (!stillCurrent) action = stopRequested ? STOP : NONE;
+  }
+
+  bool written = action == RUN ? sendMotorFrame(mask, value)
+                               : action == STOP ? sendMotorFrame(0, 1000)
+                                                : true;
+  if (!written) {
+    portENTER_CRITICAL(&g_mspMux);
+    g_msp.errors++;
+    portEXIT_CRITICAL(&g_mspMux);
+    if (action == RUN) {
+      portENTER_CRITICAL(&g_motorMux);
+      if (g_motor.active && g_motor.generation == generation) {
+        g_motor.active = false;
+        g_motor.stopFrames = 10;
+        g_motor.generation++;
+      }
+      portEXIT_CRITICAL(&g_motorMux);
+      aborted = true;
+      abortReason = "uart_write";
     }
+  } else if (action == STOP) {
+    portENTER_CRITICAL(&g_motorMux);
+    if (g_motor.stopFrames) stopped = --g_motor.stopFrames == 0;
+    ackStart = g_motor.ackStart;
+    portEXIT_CRITICAL(&g_motorMux);
+  }
+
+  if (aborted) {
+    char line[160];
+    snprintf(line, sizeof(line), "{\"type\":\"motortest\",\"state\":\"stopping\",\"reason\":\"%s\"}",
+             abortReason);
+    emitLine(line);
+  }
+  if (stopped) {
+    char line[120];
+    portENTER_CRITICAL(&g_mspMux);
+    uint32_t acks = g_msp.motorAcks;
+    portEXIT_CRITICAL(&g_mspMux);
+    snprintf(line, sizeof(line), "{\"type\":\"motortest\",\"state\":\"stopped\",\"fc_acks\":%lu}",
+             (unsigned long)(acks - ackStart));
+    emitLine(line);
   }
 }
 
@@ -876,6 +1219,7 @@ static void mspTask(void *) {
   // 모터 시험 중 보드가 재부팅되면 FC는 마지막 모터 값을 계속 유지한다 → 켜질 때마다 정지부터 보낸다
   portENTER_CRITICAL(&g_motorMux);
   g_motor.stopFrames = 10;
+  g_motor.generation++;
   portEXIT_CRITICAL(&g_motorMux);
   TickType_t wake = xTaskGetTickCount();
   uint32_t cycle = 0, lastReport = 0;
@@ -896,34 +1240,75 @@ static void mspTask(void *) {
       uint8_t f[8];
       Serial2.write(f, mspEncode(MSP_SONAR_ALTITUDE, nullptr, 0, f));
     }
-
-    if (g_mspEnabled || g_kill) {
-      // 꺼져 있으면 아무것도 보내지 않는다 → INAV는 약 1초 안에 조종기 입력으로 돌아간다.
-      // 단, 킬이 켜져 있으면 msp off 여도 킬 채널을 계속 보낸다.
-      uint16_t ch[MSP_CHANNELS];
-      computeSticks(ch, CTRL_THROTTLE_ENABLED);
-      uint8_t frame[6 + 2 * MSP_CHANNELS];
-      Serial2.write(frame, mspEncodeRawRc(ch, MSP_CHANNELS, frame));
-      if (cycle % MSP_POLL_EVERY == 0) Serial2.write(frame, mspEncode(MSP_RC, nullptr, 0, frame));
-      portENTER_CRITICAL(&g_mspMux);
-      g_msp.sent++;
-      memcpy(g_msp.out, ch, sizeof(ch));
-      portEXIT_CRITICAL(&g_mspMux);
-
-      if (simActive()) {
-        // 시뮬레이터는 브라우저가 FC 역할을 한다 → 스로틀까지 포함한 값을 USB로 20Hz 전달
-        uint16_t sc[MSP_CHANNELS];
-        computeSticks(sc, true);
-        CtrlState c = ctrlSnapshot();
-        char line[200];
-        snprintf(line, sizeof(line),
-                 "{\"type\":\"rc\",\"t\":%lu,\"ch\":[%u,%u,%u,%u],\"seen\":%s,\"centered\":%s,"
-                 "\"phase\":\"%s\",\"sim_h\":%.1f}",
-                 (unsigned long)millis(), sc[MSP_CH_ROLL], sc[MSP_CH_PITCH], sc[MSP_CH_THROTTLE], sc[MSP_CH_YAW],
-                 c.seen ? "true" : "false", c.centered ? "true" : "false", PHASE_CODE[c.phase],
-                 (float)g_simHeightCm);
-        emitLine(line);
+    if (g_approachMode != APM_OFF) {  // 접근 제어 입력: 광류 20Hz, 자세 10Hz
+      if (cycle % FC_FLOW_POLL_EVERY == 0) {
+        uint8_t f[12];
+        Serial2.write(f, mspEncodeV2(MSP2_INAV_OPTICAL_FLOW, nullptr, 0, f));
       }
+      if (cycle % FC_ATT_POLL_EVERY == 0) {
+        uint8_t f[8];
+        Serial2.write(f, mspEncode(MSP_ATTITUDE, nullptr, 0, f));
+      }
+    }
+    if (cycle % MSP_POLL_EVERY == 0) {
+      // MANUAL에서도 계속 조회해야 CH6=1000 복귀를 감지할 수 있다.
+      uint8_t f[8];
+      Serial2.write(f, mspEncode(MSP_RC, nullptr, 0, f));
+    }
+
+    RcAuthoritySnapshot authority = rcAuthoritySnapshot(millis());
+    ControlFlags flags = controlFlagsSnapshot();
+    if (g_approachMode == APM_ON || g_approachMode == APM_SHADOW) {
+      approachStep(authority, flags, 1.0f / MSP_SEND_HZ);  // 수동 중에도 계산·로그는 계속 (FAULT manual_authority)
+      if (cycle % APPROACH_REPORT_EVERY == 0) emitApproach(authority);
+    }
+    bool motorBusy = motorCommandBusy();
+    bool releasePending = flags.killReleaseFrames != 0;
+    portENTER_CRITICAL(&g_mspMux);
+    g_msp.rawRcTxActive = false;
+    portEXIT_CRITICAL(&g_mspMux);
+    bool rawRcAllowed = flags.kill || (!motorBusy && (flags.mspEnabled || releasePending));
+    if (authority.automatic && rawRcAllowed) {
+      // 유효한 CH6=AUTO 응답이 있을 때만 SET_RAW_RC를 보낸다.
+      // CH6=MANUAL·응답 만료·부팅 직후·모터 시험 중에는 조종기/정지 프레임을 우선한다.
+      uint16_t ch[MSP_CHANNELS];
+      bool releaseOnly = releasePending && !flags.mspEnabled && !flags.kill;
+      if (releaseOnly) {
+        for (int i = 0; i < MSP_CHANNELS; i++) ch[i] = 1500;
+        ch[MSP_CH_KILL] = KILL_OFF_US;
+      } else {
+        computeSticks(ch, CTRL_THROTTLE_ENABLED, flags.kill);
+      }
+      uint8_t frame[6 + 2 * MSP_CHANNELS];
+      size_t frameLen = mspEncodeRawRc(ch, MSP_CHANNELS, frame);
+      bool written = Serial2.write(frame, frameLen) == frameLen;
+      portENTER_CRITICAL(&g_mspMux);
+      if (written) {
+        g_msp.sent++;
+        g_msp.lastRawRcTxMs = millis();
+        g_msp.rawRcTxActive = true;
+        g_msp.lastRawRcKill = flags.kill;
+        memcpy(g_msp.out, ch, sizeof(ch));
+      } else {
+        g_msp.errors++;
+      }
+      portEXIT_CRITICAL(&g_mspMux);
+      if (written && releasePending) consumeKillReleaseFrame();
+    }
+
+    if (simActive()) {
+      // 시뮬레이터 출력은 실제 FC 제어권과 분리한다. 이 블록은 UART에 SET_RAW_RC를 보내지 않는다.
+      uint16_t sc[MSP_CHANNELS];
+      computeSticks(sc, true, flags.kill);
+      CtrlState c = ctrlSnapshot();
+      char line[200];
+      snprintf(line, sizeof(line),
+               "{\"type\":\"rc\",\"t\":%lu,\"ch\":[%u,%u,%u,%u],\"seen\":%s,\"centered\":%s,"
+               "\"phase\":\"%s\",\"sim_h\":%.1f}",
+               (unsigned long)millis(), sc[MSP_CH_ROLL], sc[MSP_CH_PITCH], sc[MSP_CH_THROTTLE], sc[MSP_CH_YAW],
+               c.seen ? "true" : "false", c.centered ? "true" : "false", PHASE_CODE[c.phase],
+               (float)g_simHeightCm);
+      emitLine(line);
     }
 
     cycle++;
@@ -1026,22 +1411,36 @@ static void sendSnapshot(camera_fb_t *fb) {
 // 부팅/정보 메시지, 명령 처리
 // ---------------------------------------------------------------------------
 static void emitInfo(const char *type) {
-  char line[820];
+  RcAuthoritySnapshot authority = rcAuthoritySnapshot(millis());
+  ControlFlags flags = controlFlagsSnapshot();
+  portENTER_CRITICAL(&g_mspMux);
+  MspStats msp = g_msp;
+  portEXIT_CRITICAL(&g_mspMux);
+  bool rcTx = msp.rawRcTxActive;
+  bool killTx = rcTx && msp.lastRawRcKill;
+  char ch6[8] = "null";
+  if (authority.fresh) snprintf(ch6, sizeof(ch6), "%u", authority.channelUs);
+  char line[960];
   snprintf(line, sizeof(line),
            "{\"type\":\"%s\",\"build\":\"%s\",\"wifi\":false,\"camera\":%s,\"camera_sensor\":\"%s\","
            "\"frame\":\"%dx%d\",\"tag_family\":\"%s\",\"tags_registered\":%u,\"decimate\":%.1f,"
            "\"dec_mode\":\"%s\",\"psram_free\":%u,\"heap_free\":%u,\"rear\":\"USB+BLE+MSP\",\"rx\":%d,\"tx\":%d,"
-           "\"fc_tx\":%d,\"fc_rx\":%d,\"msp\":%s,\"throttle_ctrl\":%s,\"sim\":%s,\"ble\":\"%s\","
+           "\"fc_tx\":%d,\"fc_rx\":%d,\"msp\":%s,\"authority\":\"%s\",\"authority_fresh\":%s,\"ch6\":%s,"
+           "\"rc_tx\":%s,\"kill\":%s,\"kill_tx\":%s,\"throttle_ctrl\":%s,\"sim\":%s,\"ble\":\"%s\","
            "\"ble_connected\":%s,\"ble_mtu\":%u,\"ble_dropped\":%lu,\"ble_buf\":\"%d/%d\",\"ram_min\":%u,"
-           "\"ram_largest\":%u,\"dropped_lines\":%lu,\"gimbal\":%s,\"height_src\":\"%s\"}",
+           "\"ram_largest\":%u,\"dropped_lines\":%lu,\"gimbal\":%s,\"height_src\":\"%s\",\"approach\":\"%s\"}",
            type, FW_BUILD, g_cameraOk ? "true" : "false", g_sensorName, g_frameW, g_frameH, TAG_FAMILY_NAME,
            (unsigned)TAG_COUNT, g_td ? g_td->quad_decimate : 0.0f, g_decAuto ? "auto" : "manual",
            (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap(), MTF_RX_PIN, MTF_TX_PIN, FC_TX_PIN, FC_RX_PIN,
-           g_mspEnabled ? "true" : "false", CTRL_THROTTLE_ENABLED ? "true" : "false", simActive() ? "true" : "false",
+           flags.mspEnabled ? "true" : "false", authority.automatic ? "auto" : "manual",
+           authority.fresh ? "true" : "false", ch6, rcTx ? "true" : "false",
+           flags.kill ? "true" : "false", killTx ? "true" : "false",
+           CTRL_THROTTLE_ENABLED ? "true" : "false", simActive() ? "true" : "false",
            bleName(), bleConnected() ? "true" : "false", bleMtu(), (unsigned long)bleDropped(), bleBuffersFree(),
            bleBuffersTotal(), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-           (unsigned long)g_droppedLines, GIMBAL_ENABLED ? "true" : "false", flowSnapshot().heightSrc);
+           (unsigned long)g_droppedLines, GIMBAL_ENABLED ? "true" : "false", flowSnapshot().heightSrc,
+           APPROACH_MODE_NAME[g_approachMode & 3]);
   emitLine(line);
 }
 
@@ -1110,7 +1509,7 @@ static void handleCommand(const char *buf) {
     g_decReason = "manual";
     emitInfo("info");
   } else if (strcmp(buf, "msp on") == 0 || strcmp(buf, "msp off") == 0) {
-    g_mspEnabled = (buf[5] == 'n');
+    setMspEnabled(buf[5] == 'n');
     emitMspStatus();
   } else if (strncmp(buf, "simh ", 5) == 0) {
     float h = atof(buf + 5);
@@ -1124,10 +1523,15 @@ static void handleCommand(const char *buf) {
     resetMission();
     emitMspStatus();
   } else if (strcmp(buf, "kill") == 0 || strcmp(buf, "kill on") == 0) {
-    g_kill = true;  // 이후 계속 ch8=2000 → INAV FAILSAFE(DROP) → 즉시 디스아밍, 재아밍 막힘
+    setKill(true);  // AUTO일 때 ch7=2000 → INAV FAILSAFE(DROP). MANUAL에서는 송신하지 않는다.
+    portENTER_CRITICAL(&g_motorMux);
+    g_motor.active = false;
+    g_motor.stopFrames = 10;
+    g_motor.generation++;
+    portEXIT_CRITICAL(&g_motorMux);
     emitLine("{\"type\":\"kill\",\"state\":\"on\"}");
   } else if (strcmp(buf, "kill off") == 0) {
-    g_kill = false;  // FAILSAFE 해제. 재아밍은 ARM 스위치를 내렸다 올려야 한다 (INAV: 3초간 정상 수신 필요)
+    setKill(false);  // FAILSAFE 해제. 재아밍은 ARM 스위치를 내렸다 올려야 한다 (INAV: 3초간 정상 수신 필요)
     emitLine("{\"type\":\"kill\",\"state\":\"off\"}");
   } else if (strncmp(buf, "fcmsp ", 6) == 0) {
     // fcmsp <명령번호> [hex payload]   예: fcmsp 0x2000   (255 초과면 MSP v2)
@@ -1158,6 +1562,7 @@ static void handleCommand(const char *buf) {
     portENTER_CRITICAL(&g_motorMux);
     g_motor.active = false;
     g_motor.stopFrames = 10;
+    g_motor.generation++;
     portEXIT_CRITICAL(&g_motorMux);
     emitLine("{\"type\":\"motortest\",\"state\":\"stopping\"}");
   } else if (strncmp(buf, "motortest ", 10) == 0) {
@@ -1170,6 +1575,19 @@ static void handleCommand(const char *buf) {
     if (pct <= 0 || pct > MOTOR_TEST_MAX_PCT) return cmdError("출력은 0 초과 ~ 15%");
     if (sec <= 0 || sec * 1000 > MOTOR_TEST_MAX_MS) return cmdError("시간은 0 초과 ~ 5초");
     if (!fcLinkAlive()) return cmdError("FC 응답 없음 — UART5 MSP와 배선 확인");
+    uint32_t now = millis();
+    RcAuthoritySnapshot authority = rcAuthoritySnapshot(now);
+    if (!authority.automatic) return cmdError("CH6=AUTO(1000)에서만 모터 시험 가능");
+    if (!authority.armSwitchDisarmed) return cmdError("CH5=DISARM(1000)에서만 모터 시험 가능");
+    if (!authority.throttleLow) return cmdError("스로틀 1100 이하에서만 모터 시험 가능");
+    if (controlFlagsSnapshot().kill) return cmdError("kill 해제 후 모터 시험 가능");
+    portENTER_CRITICAL(&g_mspMux);
+    FcStatus fc = g_fc;
+    portEXIT_CRITICAL(&g_mspMux);
+    if (!fc.statusAtMs || now - fc.statusAtMs > FC_STATUS_SAFE_TIMEOUT_MS)
+      return cmdError("최신 FC 아밍 상태 없음 — 시험 거부");
+    if (fc.armingFlags & ARMED_FLAG) return cmdError("FC가 아밍됨 — 모터 시험 거부");
+    if (motorCommandBusy()) return cmdError("이전 모터 시험·정지 처리 중");
     uint16_t value = (uint16_t)lroundf(1000.0f + pct * 10.0f);
     portENTER_CRITICAL(&g_mspMux);
     uint32_t acks = g_msp.motorAcks;
@@ -1177,10 +1595,11 @@ static void handleCommand(const char *buf) {
     portENTER_CRITICAL(&g_motorMux);
     g_motor.mask = mask;
     g_motor.value = value;
-    g_motor.untilMs = millis() + (uint32_t)(sec * 1000);
+    g_motor.untilMs = now + (uint32_t)(sec * 1000);
     g_motor.stopFrames = 0;
     g_motor.ackStart = acks;
     g_motor.active = true;
+    g_motor.generation++;
     portEXIT_CRITICAL(&g_motorMux);
     char line[160];
     snprintf(line, sizeof(line), "{\"type\":\"motortest\",\"state\":\"running\",\"motors\":\"%s\",\"value\":%u,\"ms\":%lu}",
@@ -1228,11 +1647,61 @@ static void handleCommand(const char *buf) {
     emitLine(line);
   } else if (strcmp(buf, "mtfraw") == 0) {
     g_mtfRawRequest = true;
+  } else if (strcmp(buf, "approach") == 0 || strncmp(buf, "approach ", 9) == 0) {
+    // approach | approach on|shadow|legacy|off | approach set <이름> <값> | approach reset | approach params
+    const char *a = buf[8] ? buf + 9 : "";
+    char name[24];
+    float v;
+    if (!a[0] || strcmp(a, "params") == 0) {
+      char pj[800];
+      approachParamsJson(g_approach.p, pj, sizeof(pj));
+      char line[900];
+      snprintf(line, sizeof(line), "{\"type\":\"approach_params\",\"mode\":\"%s\",\"params\":%s}",
+               APPROACH_MODE_NAME[g_approachMode & 3], pj);
+      emitLine(line);
+      return;
+    }
+    int newMode = -1;
+    if (strcmp(a, "off") == 0) newMode = APM_OFF;
+    else if (strcmp(a, "shadow") == 0) newMode = APM_SHADOW;
+    else if (strcmp(a, "on") == 0) newMode = APM_ON;
+    else if (strcmp(a, "legacy") == 0) newMode = APM_LEGACY;
+    if (newMode >= 0) {
+      portENTER_CRITICAL(&g_approachMux);
+      g_approach.reset();  // 모드 전환 시 적분·명령 0 에서 시작
+      g_approachOut = ApproachOutput();
+      g_approachMode = newMode;
+      portEXIT_CRITICAL(&g_approachMux);
+      char line[120];
+      snprintf(line, sizeof(line), "{\"type\":\"approach_mode\",\"mode\":\"%s\"}", APPROACH_MODE_NAME[newMode]);
+      emitLine(line);
+      return;
+    }
+    if (strcmp(a, "reset") == 0) {
+      portENTER_CRITICAL(&g_approachMux);
+      g_approach.reset();
+      g_approachOut = ApproachOutput();
+      portEXIT_CRITICAL(&g_approachMux);
+      emitLine("{\"type\":\"approach_mode\",\"reset\":true}");
+      return;
+    }
+    if (sscanf(a, "set %23s %f", name, &v) == 2) {
+      ApproachParams p = g_approach.p;
+      if (!approachSetParam(p, name, v)) return cmdError("approach set: 모르는 이름이거나 범위 밖 (approach params 로 목록)");
+      portENTER_CRITICAL(&g_approachMux);
+      g_approach.p = p;
+      portEXIT_CRITICAL(&g_approachMux);
+      char line[120];
+      snprintf(line, sizeof(line), "{\"type\":\"approach_set\",\"name\":\"%s\",\"value\":%.3f}", name, v);
+      emitLine(line);
+      return;
+    }
+    cmdError("형식: approach [on|shadow|legacy|off|reset|params|set <이름> <값>]");
   } else if (strcmp(buf, "info") == 0) {
     emitInfo("info");
   } else if (buf[0]) {
     emitLine("{\"type\":\"help\",\"commands\":[\"snap\",\"tags\",\"size <id> <mm>\",\"land <id> <x_mm> <y_mm>\","
-             "\"reset <id>\",\"dec auto\",\"dec <1.0~4.0>\",\"msp on|off\",\"mission reset\",\"simh <cm>\",\"sim off\",\"mtfraw\",\"motortest <1~4|all> <pct> <sec>\",\"motorstop\",\"kill\",\"kill off\",\"fcmsp <cmd> [hex]\",\"rec <sec>\",\"voicecmd <키워드>\",\"cam [<팬> <틸트>|down|front|off|us <p> <t>]\",\"info\"]}");
+             "\"reset <id>\",\"dec auto\",\"dec <1.0~4.0>\",\"msp on|off\",\"mission reset\",\"simh <cm>\",\"sim off\",\"mtfraw\",\"motortest <1~4|all> <pct> <sec>\",\"motorstop\",\"kill\",\"kill off\",\"fcmsp <cmd> [hex]\",\"rec <sec>\",\"voicecmd <키워드>\",\"cam [<팬> <틸트>|down|front|off|us <p> <t>]\",\"approach [on|shadow|legacy|off|reset|params|set <k> <v>]\",\"info\"]}");
   }
 }
 

@@ -1,6 +1,6 @@
 # 태그인식 보드 펌웨어 (XIAO ESP32S3 Sense)
 
-빌드: `TAGVISION-20261003-18`
+빌드: `TAGVISION-20261010-22`
 
 - 카메라(OV2640, 640×480 회색조)로 AprilTag `tag36h11`(ID 0~586)를 인식한다.
 - 인식한 태그의 의미를 해석하고 이동 방향을 판단한다.
@@ -95,11 +95,13 @@ python3 tools/tag_monitor.py --raw            # JSON 원문
 | `reset <id>` | 그 ID의 NVS 설정을 지우고 `config.h` 값으로 되돌림 |
 | `dec auto` | decimate 자동 전환 (기본) |
 | `dec <1.0~4.0>` | decimate 수동 고정. 재부팅하면 자동으로 돌아감 |
-| `msp on` / `msp off` | FC로 MSP 송신 켜기/끄기. 끄면 INAV는 약 1초 안에 조종기 입력으로 돌아간다 |
+| `msp on` / `msp off` | 자율 RC 송신 허용/중지. `on`이어도 CH6=AUTO(약 1000)에서만 송신한다 |
 | `mission reset` | 미션 단계를 '정렬'로 되돌림 |
 | `simh <cm>` | 시뮬레이션 고도. 받는 동안 MTF-01P 대신 이 높이를 쓰고 `rc` 메시지를 낸다. 2초간 없으면 실제 센서로 복귀 (`sim/` 시뮬레이터가 사용) |
 | `sim off` | 시뮬레이션 즉시 종료 |
 | `mtfraw` | MTF-01P로 들어오는 다음 64바이트를 hex로 출력 (형식·배선 진단) |
+| `motortest <1~4\|all> <pct> <sec>` | CH6=AUTO·FC 디스암·최신 상태일 때만 모터 시험(최대 15%·5초) |
+| `motorstop` | 모터 시험을 중단하고 1000µs 정지 프레임을 반복 전송 |
 | `info` | 현재 설정 출력 |
 
 ## 출력 메시지
@@ -111,7 +113,7 @@ python3 tools/tag_monitor.py --raw            # JSON 원문
 | `flow` | 5Hz | 기존 RIDER-SERIAL과 같은 키: height_cm, forward/right/up_cm_s, quality, packets, errors + proto(micolink/msp), sim |
 | `tag` | 인식한 태그마다 | id, registered, meaning, side_px, rot_deg, tag_size_mm, land_px, dist_est_cm, margin |
 | `target` | 미션 태그가 보이는 프레임마다 | **판단 결과**: id, decision(`OVER_TARGET`/`MOVE`), move_ko, next_ko, body_right_cm, body_fwd_cm, height_cm, decimate |
-| `msp` | 1Hz | enabled, fc_link, sent, acks, errors, out(보낸 채널 값), fc_rc(FC가 실제 쓰는 채널 값), phase |
+| `msp` | 1Hz | enabled, fc_link, authority, authority_fresh, ch6, rc_tx, out(실제 송신 중인 채널), fc_rc, kill/kill_tx, phase |
 | `rc` | 시뮬레이션 중 20Hz | ch(롤·피치·스로틀·요), seen, centered, phase, sim_h. 시뮬레이터에는 스로틀도 보낸다(실제 MSP는 `CTRL_THROTTLE_ENABLED`를 따름) |
 | `vision` | 2Hz | fps, detect_ms, ids, target_id, decimate_used/next, dec_mode, dec_reason |
 
@@ -171,8 +173,8 @@ land 10 -170 0     # ID 10 중심에서 왼쪽 170mm가 착륙 지점
 ### INAV 설정
 
 1. Ports 탭에서 UART5의 **MSP를 켠다** (115200).
-2. Modes 탭에서 **MSP RC OVERRIDE**를 조종기 AUX 스위치에 연결한다. 이 스위치 채널은 INAV가 MSP 덮어쓰기에서 자동으로 제외한다.
-3. CLI에서 `set msp_override_channels = 3` 후 `save`. 3은 롤(비트0)+피치(비트1)다.
+2. Modes 탭에서 **MSP RC OVERRIDE**를 CH6 스위치에 연결한다. CH6 약 1000=AUTO, 약 2000=MANUAL로 사용한다.
+3. CLI에서 `set msp_override_channels = 67` 후 `save`. 67은 롤(비트0)+피치(비트1)+킬 CH7(비트6)이다.
    - 스로틀(비트2, 합계 7)은 `CTRL_THROTTLE_ENABLED=true`로 빌드하고 **ALTHOLD처럼 스로틀 중앙이 고도 유지인 모드**에서만 넣는다.
 4. Channel Map이 AETR이 아니면 `config.h`의 `MSP_CH_*`를 같은 순서로 바꾼다.
 
@@ -191,8 +193,9 @@ land 10 -170 0     # ID 10 중심에서 왼쪽 170mm가 착륙 지점
 ### 안전 동작 (INAV 소스 `rx/msp_override.c`, `rx/rx.c` 기준)
 
 - 덮어쓰기는 **MSP RC OVERRIDE 모드가 켜져 있고**, `msp_override_channels`에 포함된 채널에만 적용된다.
-- 보드가 멈추거나 `msp off`로 송신이 끊기면, 마지막 프레임부터 약 0.7~0.9초 안에 조종기 입력으로 돌아간다(`failsafe_delay` 기본 0.5초 + 0.2초). 그 사이에는 마지막 값을 유지한다.
-- 스위치를 내리면 즉시 조종기 입력으로 돌아간다.
+- ESP32도 FC의 CH6를 20Hz로 읽어 INAV 모드 범위와 같은 **900~1700에서만** `MSP_SET_RAW_RC`를 보낸다. 범위 밖, 부팅 직후, 잘못된 값, 250ms 응답 만료는 모두 MANUAL이다.
+- CH6=MANUAL이면 ESP32 송신을 약 50~100ms 안에 중단하고 INAV도 MSP 덮어쓰기를 끈다. MANUAL에서도 `MSP_RC` 조회는 유지해 AUTO 복귀를 감지한다.
+- 모터 시험 중 CH6가 MANUAL이 되거나 kill·아밍·FC 상태 만료가 발생하면 즉시 출력을 중단하고 1000µs 정지 프레임을 0.5초 반복한다.
 
 ### 미션 단계
 
@@ -205,13 +208,15 @@ ALIGN ── 착륙 지점 3cm 이내 ──▶ GOTO_50 ── 50±5cm ──▶
 
 ### 첫 시험 순서 (프로펠러 제거)
 
-1. INAV Receiver 탭을 띄우고 스위치를 켠 상태에서 패널을 움직여, 롤·피치 막대가 판단 방향대로 움직이는지 본다. 모니터의 `FC가 쓰는 값`으로도 확인할 수 있다.
-2. 방향이 반대면 `CAM_ROTATE_DEG`를 고친다. 맞으면 `config.h`의 `AXES_VERIFIED`를 true로 바꾼다.
-3. 스위치 내림, XIAO 전원 차단, `msp off`일 때 조종기 입력으로 돌아오는지 확인한다.
+1. CH5=1000(DISARM), 스로틀 1000, 프로펠러 제거를 확인한다.
+2. CH6=1000에서 `msp`의 `authority:auto`, `rc_tx:true`를 확인하고 패널을 움직여 롤·피치가 판단 방향대로 움직이는지 본다.
+3. CH6=2000으로 전환해 `authority:manual`, `rc_tx:false`가 되고 조종간 롤·피치가 즉시 반영되는지 확인한다.
+4. CH6=1000으로 복귀해 자동 송신이 다시 시작되는지 확인한다. 방향이 반대면 `CAM_ROTATE_DEG`를 고친다.
 
 ### PC 테스트
 
 ```bash
+g++ -std=c++17 -I src test/rc_authority_host_test.cpp -o /tmp/rc_authority_test && /tmp/rc_authority_test
 clang++ -std=c++17 -I src test/msp_host_test.cpp -o /tmp/msp_test && /tmp/msp_test | python3 test/check_msp.py
 clang++ -std=c++17 -I src test/mtf_host_test.cpp -o /tmp/mtf_test && /tmp/mtf_test   # 실제 수신 바이트로 MTF 파서 시험
 clang++ -std=c++17 -I src test/adpcm_host_test.cpp -o /tmp/adpcm_test && /tmp/adpcm_test | python3 test/check_adpcm.py   # 녹음 압축 왕복 (SNR 32dB)

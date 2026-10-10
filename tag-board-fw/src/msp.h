@@ -12,7 +12,9 @@ static const uint16_t MSP_SONAR_ALTITUDE = 58;   // FC 거리센서 높이(cm, i
 static const uint16_t MSP_REBOOT = 68;
 static const uint16_t MSP_SET_RAW_RC = 200;
 static const uint16_t MSP_SET_MOTOR = 214;      // 아밍 전 모터 출력 직접 지정 (INAV Configurator 모터 시험과 같음)
+static const uint16_t MSP_ATTITUDE = 108;       // 롤·피치(0.1°)·요(°) — 카메라 지면점 기울기 보정용
 static const uint16_t MSP2_INAV_STATUS = 0x2000; // 아밍 플래그 32비트 전체
+static const uint16_t MSP2_INAV_OPTICAL_FLOW = 0x2001; // 품질 u8, 유량 X/Y(°/s) i16, 자이로 X/Y(°/s) i16
 static const uint16_t MSP2_INAV_ANALOG = 0x2002; // 배터리 전압·셀 수·전류
 
 inline uint8_t mspCrc8(uint8_t crc, uint8_t a) {
