@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tsbuildinfo
+# vite.config.ts를 tsc가 실수로 내보낸 산출물
+vite.config.js
+vite.config.d.ts

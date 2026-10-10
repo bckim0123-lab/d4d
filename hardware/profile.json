@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "purpose": "프로펠러 제거 상태의 ESP32→FC 롤·피치 지상 제어 경로 검증",
+  "fc": {
+    "model": "MicoAir H743 V2",
+    "target": "MICOAIR743V2",
+    "firmware": "INAV 9.1.0",
+    "usb_port_default": "COM9"
+  },
+  "companion": {
+    "model": "Seeed Studio XIAO ESP32S3 Sense",
+    "ble_name": "TagBoard-B8B4",
+    "ble_protocol": "Nordic UART Service",
+    "build": "TAGVISION-20261010-22",
+    "authority_switch": "CH6 900~1700 AUTO, 그 외·응답 만료 MANUAL(fail-closed)"
+  },
+  "rangefinder_flow": {
+    "model": "MTF-01P",
+    "connection": "FC UART4 MSP",
+    "fc_detection": [
+      "rangefinder",
+      "optical_flow"
+    ]
+  },
+  "links": {
+    "companion_to_fc": {
+      "connection": "UART5 MSP",
+      "baud": 115200
+    },
+    "receiver_to_fc": {
+      "model": "FlySky iBUS",
+      "connection": "UART6 RX_SERIAL"
+    }
+  },
+  "control": {
+    "channels": {
+      "ch5": "ARM",
+      "ch6": "MSP RC OVERRIDE",
+      "ch7": "FAILSAFE kill",
+      "ch8": "ANGLE"
+    },
+    "persistent_mask": 64,
+    "ground_test_mask": 67,
+    "overridden_by_67": [
+      "roll",
+      "pitch",
+      "kill"
+    ],
+    "never_overridden": [
+      "throttle",
+      "yaw",
+      "arm"
+    ]
+  },
+  "flight_locked": true,
+  "flight_blockers": [
+    "모터 순서·회전 방향 미확인 (10% 지상 구동 응답만 확인)",
+    "카메라/기체 축 axes_verified:false",
+    "RAM 마스크 67 적용 후 태그→롤·피치 반영 비교 미완료",
+    "실기체 공회전·킬 시험 미완료"
+  ],
+  "ground_evidence": "out/control_live/2026-10-10-ground-session.md"
+}
