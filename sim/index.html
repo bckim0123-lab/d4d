@@ -1,0 +1,835 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>태그 비행 시뮬레이터</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --ink: #1d2129;
+    --muted: #6b7280;
+    --line: #e3e6eb;
+    --accent: #2563eb;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --bad: #dc2626;
+    --chip: #eef2ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Segoe UI", sans-serif; }
+  #app { display: grid; grid-template-columns: 1fr 440px; height: 100vh; }
+  #stage { position: relative; background: #fff; overflow: hidden; }
+  #tagCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .stage-note { position: absolute; left: 12px; bottom: 10px; color: #b8bcc4; font-size: 12px; pointer-events: none; }
+  #panel { overflow-y: auto; border-left: 1px solid var(--line); background: var(--bg); padding: 12px; }
+  section.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+  section.card h2 { margin: 0 0 8px; font-size: 13px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  button { font: inherit; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 7px;
+    padding: 6px 10px; cursor: pointer; }
+  button:hover { border-color: #c7ccd4; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.on { background: #111827; border-color: #111827; color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  select, input[type=range] { font: inherit; }
+  label.slider { display: grid; grid-template-columns: 110px 1fr 56px; align-items: center; gap: 8px; margin: 4px 0; }
+  label.slider span:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: #3730a3; font-size: 12px; font-weight: 600; }
+  .chip.ok { background: #dcfce7; color: #166534; }
+  .chip.warn { background: #fef3c7; color: #92400e; }
+  .chip.bad { background: #fee2e2; color: #991b1b; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+  .kv { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dashed var(--line); padding: 2px 0; }
+  .kv b { font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+  .muted { color: var(--muted); }
+  .decision { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-top: 6px; }
+  .decision .big { font-size: 15px; font-weight: 700; }
+  canvas.plot { width: 100%; display: block; border-radius: 6px; background: #fbfcfd; border: 1px solid var(--line); }
+  .motors { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .motor { border: 1px solid var(--line); border-radius: 8px; padding: 6px; display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: end; }
+  .motor .bar { height: 64px; width: 22px; background: #eef1f5; border-radius: 4px; position: relative; overflow: hidden; }
+  .motor .fill { position: absolute; left: 0; right: 0; bottom: 0; background: var(--accent); }
+  .motor .name { font-weight: 650; }
+  .motor .val { font-variant-numeric: tabular-nums; font-size: 18px; font-weight: 700; }
+  .sticks .stick { display: grid; grid-template-columns: 56px 1fr 44px; gap: 8px; align-items: center; margin: 3px 0; }
+  .sticks .track { height: 10px; background: #eef1f5; border-radius: 5px; position: relative; }
+  .sticks .track::after { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: #9aa3af; }
+  .sticks .knob { position: absolute; top: 0; height: 10px; background: var(--accent); border-radius: 5px; }
+  .sticks span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; max-height: 150px; overflow-y: auto; white-space: pre-wrap; color: #374151; }
+  #snapModal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 10; }
+  #snapModal .box { background: #fff; border-radius: 10px; padding: 12px; max-width: 92vw; }
+  #snapModal img { max-width: 80vw; max-height: 70vh; display: block; border-radius: 6px; }
+  @media (max-width: 900px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: 60vh auto; height: auto; }
+    #panel { border-left: 0; border-top: 1px solid var(--line); padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="tagCanvas"></canvas>
+    <div class="stage-note">XIAO 카메라를 이 흰 영역 중앙에 25~35cm 거리로 맞추세요 · 화면 밝기 최대</div>
+  </div>
+
+  <aside id="panel">
+    <section class="card">
+      <h2>보드 연결 <span id="connChip" class="chip bad">연결 안 됨</span></h2>
+      <div class="row">
+        <button id="btnConnect" class="primary">USB 연결</button>
+        <button id="btnBle" class="primary">블루투스 연결</button>
+        <button id="btnSnap" disabled>카메라 화면 보기</button>
+      </div>
+      <div class="muted" id="boardInfo">Chrome 또는 Edge에서 열어야 합니다. USB로 연결하면 보드가 재부팅되고, 블루투스는 재부팅하지 않습니다.</div>
+    </section>
+
+    <section class="card">
+      <h2>카메라 ↔ 화면 보정 <span id="calChip" class="chip warn">미보정</span></h2>
+      <div class="row">
+        <button id="btnCalib" disabled>자동 보정</button>
+        <span class="muted" id="calText">태그를 화면 세 곳에 그려 카메라 방향·위치를 맞춥니다</span>
+      </div>
+      <label class="slider"><span>1m 고도 태그 크기</span><input id="kSlider" type="range" min="120" max="420" step="10"><span id="kVal"></span></label>
+    </section>
+
+    <section class="card">
+      <h2>시뮬레이션 <span id="srcChip" class="chip">입력: 조종기</span></h2>
+      <div class="row">
+        <button id="btnRun" class="primary">시작</button>
+        <button id="btnReset">리셋(무작위 위치)</button>
+        <select id="modeSel" title="INAV 비행 모드 가정">
+          <option value="POSHOLD">POSHOLD (스틱 = 속도)</option>
+          <option value="ANGLE">ANGLE (스틱 = 기울기)</option>
+        </select>
+      </div>
+      <div class="row">
+        <button id="btnSource" class="on" title="조종기 AUX 스위치(MSP RC OVERRIDE) 역할">조종권: 보드</button>
+        <button id="btnMsp">보드 MSP 끊기</button>
+        <button id="btnHide">태그 가리기</button>
+        <button id="btnGust">돌풍</button>
+      </div>
+      <label class="slider"><span>바람 세기</span><input id="windSpeed" type="range" min="0" max="60" step="1" value="0"><span id="windSpeedVal"></span></label>
+      <label class="slider"><span>바람 방향</span><input id="windDir" type="range" min="0" max="350" step="10" value="90"><span id="windDirVal"></span></label>
+    </section>
+
+    <section class="card">
+      <h2>판단 <span id="phaseChip" class="chip">정렬</span></h2>
+      <div class="decision">
+        <div class="big" id="decBig">대기 중</div>
+        <div id="decMove" class="muted">—</div>
+        <div id="decNext">—</div>
+      </div>
+      <div class="grid2" style="margin-top:8px">
+        <div class="kv"><span>고도(시뮬)</span><b id="vH">—</b></div>
+        <div class="kv"><span>착륙점까지</span><b id="vErr">—</b></div>
+        <div class="kv"><span>보드 인식 오차</span><b id="vPerc">—</b></div>
+        <div class="kv"><span>보드 fps · 검출</span><b id="vFps">—</b></div>
+        <div class="kv"><span>decimate</span><b id="vDec">—</b></div>
+        <div class="kv"><span>판단 후 경과</span><b id="vAge">—</b></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>위에서 본 위치</h2>
+      <canvas id="mapCanvas" class="plot" height="230"></canvas>
+      <div class="muted" style="margin-top:4px">빨간 십자 = 착륙 지점, 원 = 정렬 허용 3cm, 파란 선 = 최근 10초 궤적</div>
+    </section>
+
+    <section class="card">
+      <h2>스틱 입력 (보드 → FC)</h2>
+      <div class="sticks">
+        <div class="stick"><span>롤</span><div class="track"><div class="knob" id="kRoll"></div></div><span id="sRoll">1500</span></div>
+        <div class="stick"><span>피치</span><div class="track"><div class="knob" id="kPitch"></div></div><span id="sPitch">1500</span></div>
+        <div class="stick"><span>스로틀</span><div class="track"><div class="knob" id="kThr"></div></div><span id="sThr">1500</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>모터 출력 (INAV 쿼드 X 믹서)</h2>
+      <div class="motors">
+        <div class="motor"><div class="bar"><div class="fill" id="fM4"></div></div><div><div class="name">M4 앞왼쪽</div><div class="val" id="vM4">—</div></div></div>
+        <div class="motor"><div class="bar"><div class="fill" id="fM2"></div></div><div><div class="name">M2 앞오른쪽</div><div class="val" id="vM2">—</div></div></div>
+        <div class="motor"><div class="bar"><div class="fill" id="fM3"></div></div><div><div class="name">M3 뒤왼쪽</div><div class="val" id="vM3">—</div></div></div>
+        <div class="motor"><div class="bar"><div class="fill" id="fM1"></div></div><div><div class="name">M1 뒤오른쪽</div><div class="val" id="vM1">—</div></div></div>
+      </div>
+      <div class="muted" style="margin-top:6px">기울기를 바꾸는 순간에만 좌우·앞뒤 모터 차이가 생기고, 기운 채로 유지할 때는 다시 비슷해집니다.</div>
+    </section>
+
+    <section class="card">
+      <h2>기록 (최근 30초)</h2>
+      <canvas id="plotH" class="plot" height="110"></canvas>
+      <div class="muted" style="margin:2px 0 8px">고도 — 점선 50cm·100cm</div>
+      <canvas id="plotE" class="plot" height="90"></canvas>
+      <div class="muted" style="margin-top:2px">착륙 지점까지 수평 거리(cm) — 점선 3cm</div>
+    </section>
+
+    <section class="card">
+      <h2>이벤트</h2>
+      <div id="log"></div>
+    </section>
+  </aside>
+</div>
+
+<div id="snapModal"><div class="box"><img id="snapImg" alt="보드 카메라 화면"><div class="row"><span class="muted">보드 카메라가 보는 화면</span><button id="btnSnapClose">닫기</button></div></div></div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// 상수
+// ---------------------------------------------------------------------------
+// tag36h11 ID 10 (흰 여백 1칸 포함 10×10, 1=흰색) — AprilRobotics/apriltag-imgs
+const TAG10 = ['1111111111', '1000000001', '1000110101', '1000111101', '1011101001',
+               '1001000101', '1010111001', '1000011001', '1000000001', '1111111111'];
+const TAG_SIZE_CM = 20;           // 펌웨어 config.h 의 ID 10 크기와 같아야 한다
+const PHASE_KO = { ALIGN: '정렬', GOTO_50: '50cm로 이동', HOLD_50: '50cm 유지', GOTO_100: '100cm로 이동', HOVER: '호버링(완료)' };
+const G = 9.81;
+const CFG = {
+  deadband: 10,            // INAV pos_hold_deadband 기본값 (µs)
+  vmax: 7.5,               // POSHOLD 최대 수평 속도 (이 FC의 nav_manual_speed 750cm/s)
+  vzmax: 2.0,              // ALTHOLD 최대 상승 속도 (INAV nav_manual_climb_rate 200cm/s)
+  maxTilt: 45 * Math.PI / 180,   // 이 FC의 max_angle_inclination 45°
+  tauV: 0.4, tauZ: 0.5, tauTilt: 0.12,
+  drag: 0.6,               // ANGLE 모드 공기저항 (1/s)
+  windReject: 0.85,        // POSHOLD 에서 FC가 바람을 상쇄하는 비율
+  hoverUs: 1300,           // 이 FC의 nav_mc_hover_thr
+  fallbackMs: 800,         // MSP가 끊기면 INAV가 조종기로 돌아가는 시간 (약 0.7~0.9초)
+};
+
+// ---------------------------------------------------------------------------
+// 상태
+// ---------------------------------------------------------------------------
+const sim = { x: 0, y: 0, vx: 0, vy: 0, h: 1.2, vz: 0, roll: 0, pitch: 0, rollRate: 0, pitchRate: 0,
+              running: false, motors: [1300, 1300, 1300, 1300] };
+const ui = { mode: 'POSHOLD', source: 'board', windSpeed: 0, windDir: 90, hideTag: false, mspOff: false, K: 260 };
+const board = { connected: false, build: '', rc: null, rcAt: 0, target: null, targetAt: 0, vision: null,
+                phase: 'ALIGN', seen: false, simFlag: false, perc: null };
+let calib = loadCalib();
+let calState = null;       // 보정 진행 중 상태
+let snap = null;           // 스냅샷 수신 중 상태
+const hist = [];           // 기록 {t, h, err}
+const trail = [];          // 궤적 {t, x, y}
+
+function loadCalib() {
+  try {
+    const c = JSON.parse(localStorage.getItem('tagsim.calib'));
+    if (c && c.R && c.dc) return c;
+  } catch (e) { /* 저장소 없음 */ }
+  return { R: [[1, 0], [0, -1]], dc: [0, 0], ok: false };
+}
+function saveCalib() { try { localStorage.setItem('tagsim.calib', JSON.stringify(calib)); } catch (e) {} }
+try { const k = +localStorage.getItem('tagsim.K'); if (k >= 120 && k <= 420) ui.K = k; } catch (e) {}
+
+// ---------------------------------------------------------------------------
+// 작은 수학 도구
+// ---------------------------------------------------------------------------
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const inv2 = (m) => { const d = m[0][0] * m[1][1] - m[0][1] * m[1][0]; return [[m[1][1] / d, -m[0][1] / d], [-m[1][0] / d, m[0][0] / d]]; };
+const mul2 = (m, v) => [m[0][0] * v[0] + m[0][1] * v[1], m[1][0] * v[0] + m[1][1] * v[1]];
+const mean2 = (arr) => [arr.reduce((s, p) => s + p[0], 0) / arr.length, arr.reduce((s, p) => s + p[1], 0) / arr.length];
+// INAV 스틱 처리: 중앙 데드밴드를 빼고 -1..1 로
+function stickNorm(us) {
+  const v = us - 1500;
+  if (Math.abs(v) <= CFG.deadband) return 0;
+  return clamp((v - Math.sign(v) * CFG.deadband) / (500 - CFG.deadband), -1, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 이벤트 기록
+// ---------------------------------------------------------------------------
+const logEl = document.getElementById('log');
+function log(msg) {
+  const t = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+  logEl.textContent = `${t}  ${msg}\n` + logEl.textContent.split('\n').slice(0, 60).join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Web Serial
+// ---------------------------------------------------------------------------
+let port = null, reader = null, writer = null, readDone = null, sendChain = Promise.resolve();
+let transport = null;                 // 'usb' | 'ble'
+let bleDev = null, bleRx = null;
+const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // PC → 보드 (명령)
+const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // 보드 → PC (JSON 줄)
+
+async function connect() {
+  if (!('serial' in navigator)) { alert('이 브라우저는 Web Serial을 지원하지 않습니다. Chrome 또는 Edge에서 열어 주세요.'); return; }
+  try {
+    // Espressif(0x303a) 장치만 고른다 → FC(INAV) 포트에 명령을 보내는 실수를 막는다
+    port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
+    await port.open({ baudRate: 115200, bufferSize: 1 << 16 });
+    try { await port.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch (e) {}
+    writer = port.writable.getWriter();
+    board.connected = true;
+    transport = 'usb';
+    log('USB 연결됨 — 재부팅 후 데이터가 들어옵니다');
+    readDone = readLoop();
+    updateConnUi();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') log('연결 실패: ' + e.message);
+  }
+}
+
+// 블루투스(BLE Nordic UART Service). 보드 이름 TagBoard-XXXX, 재부팅 없음.
+async function connectBle() {
+  if (!navigator.bluetooth) { alert('이 브라우저는 Web Bluetooth를 지원하지 않습니다. Chrome에서 열어 주세요.'); return; }
+  try {
+    bleDev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'TagBoard' }], optionalServices: [NUS] });
+    bleDev.addEventListener('gattserverdisconnected', () => {
+      if (transport !== 'ble') return;
+      log('블루투스 연결이 끊겼습니다');
+      board.connected = false; transport = null; bleRx = null;
+      updateConnUi();
+    });
+    const svc = await (await bleDev.gatt.connect()).getPrimaryService(NUS);
+    bleRx = await svc.getCharacteristic(NUS_RX);
+    const tx = await svc.getCharacteristic(NUS_TX);
+    const decoder = new TextDecoder();
+    let buf = '';
+    tx.addEventListener('characteristicvaluechanged', (e) => {
+      buf += decoder.decode(e.target.value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { handleLine(buf.slice(0, i).replace(/\r$/, '')); buf = buf.slice(i + 1); }
+    });
+    await tx.startNotifications();
+    board.connected = true;
+    transport = 'ble';
+    log(`블루투스 연결됨: ${bleDev.name}`);
+    send('info');
+    updateConnUi();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') log('블루투스 연결 실패: ' + e.message);
+  }
+}
+
+async function disconnect() {
+  if (transport === 'ble') {
+    board.connected = false;
+    transport = null;
+    try { bleDev && bleDev.gatt.disconnect(); } catch (e) {}
+    bleRx = null;
+    updateConnUi();
+    return;
+  }
+  board.connected = false;
+  try { if (reader) await reader.cancel(); } catch (e) {}
+  try { if (readDone) await readDone; } catch (e) {}   // 수신 루프가 잠금을 풀 때까지
+  try { await sendChain; } catch (e) {}
+  try { if (writer) writer.releaseLock(); } catch (e) {}
+  try { if (port) await port.close(); } catch (e) {}
+  port = reader = writer = readDone = null;
+  transport = null;
+  updateConnUi();
+}
+
+async function readLoop() {
+  const decoder = new TextDecoder();
+  let buf = '';
+  reader = port.readable.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).replace(/\r$/, '');
+        buf = buf.slice(i + 1);
+        handleLine(line);
+      }
+    }
+  } catch (e) {
+    log('수신 중단: ' + e.message);
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+  }
+  if (board.connected) {
+    log('보드 연결이 끊겼습니다');
+    readDone = null;                                      // 자기 자신을 기다리지 않도록
+    await disconnect();
+  }
+}
+
+// 쓰기는 하나씩 차례로 (BLE는 GATT 작업이 겹치면 오류가 난다)
+function send(cmd) {
+  const data = new TextEncoder().encode(cmd + '\n');
+  if (transport === 'ble' && bleRx) sendChain = sendChain.then(() => bleRx.writeValueWithoutResponse(data)).catch(() => {});
+  else if (transport === 'usb' && writer) sendChain = sendChain.then(() => writer.write(data)).catch(() => {});
+}
+
+function handleLine(line) {
+  if (snap) {
+    if (line.startsWith('SNAP_END')) {
+      document.getElementById('snapImg').src = 'data:image/jpeg;base64,' + snap.data.join('');
+      document.getElementById('snapModal').style.display = 'flex';
+      snap = null;
+    } else if (line && line[0] !== '{') {
+      snap.data.push(line.trim());
+    }
+    return;
+  }
+  if (line.startsWith('SNAP_BEGIN')) { snap = { data: [] }; return; }
+  if (line[0] !== '{') return;
+  let o;
+  try { o = JSON.parse(line); } catch (e) { return; }
+  const now = performance.now();
+  switch (o.type) {
+    case 'boot':
+    case 'info':
+      board.build = o.build;
+      if (o.type === 'boot') log(`보드 부팅: ${o.build} · 카메라 ${o.camera ? o.camera_sensor : '실패'}`);
+      if (o.type === 'boot' && o.sim === undefined) log('⚠ 이 펌웨어는 시뮬레이션 모드(simh)를 지원하지 않습니다. 최신 펌웨어를 올려 주세요.');
+      updateConnUi();
+      break;
+    case 'rc':
+      board.rc = o;
+      board.rcAt = now;
+      if (o.phase !== board.phase) { log(`단계: ${PHASE_KO[board.phase] || board.phase} → ${PHASE_KO[o.phase] || o.phase}`); board.phase = o.phase; }
+      if (o.seen !== board.seen) { log(o.seen ? '보드가 태그를 찾음' : '보드가 태그를 놓침 → 중립'); board.seen = o.seen; }
+      break;
+    case 'target':
+      board.target = o;
+      board.targetAt = now;
+      if (calState && calState.collecting && o.id === 10) calState.samples.push([o.img_right_cm, o.img_up_cm]);
+      if (!calState) {
+        const q = [-sim.x * 100, -sim.y * 100];
+        board.perc = Math.hypot(o.img_right_cm - q[0], o.img_up_cm - q[1]);
+      }
+      break;
+    case 'vision':
+      board.vision = o;
+      break;
+    case 'flow':
+      board.simFlag = !!o.sim;
+      break;
+  }
+}
+
+function updateConnUi() {
+  const chip = document.getElementById('connChip');
+  chip.textContent = board.connected ? (transport === 'ble' ? '블루투스 연결됨' : 'USB 연결됨') : '연결 안 됨';
+  chip.className = 'chip ' + (board.connected ? 'ok' : 'bad');
+  document.getElementById('btnConnect').textContent = board.connected && transport === 'usb' ? '연결 해제' : 'USB 연결';
+  document.getElementById('btnBle').textContent = board.connected && transport === 'ble' ? '연결 해제' : '블루투스 연결';
+  document.getElementById('btnConnect').disabled = board.connected && transport !== 'usb';
+  document.getElementById('btnBle').disabled = board.connected && transport !== 'ble';
+  document.getElementById('btnSnap').disabled = !board.connected;
+  document.getElementById('btnCalib').disabled = !board.connected;
+  document.getElementById('boardInfo').textContent = board.connected
+    ? `펌웨어 ${board.build || '(부팅 대기)'} · ${board.simFlag ? '시뮬레이션 고도 사용 중' : '실제 센서 고도'}`
+    : 'Chrome 또는 Edge에서 열어야 합니다. USB로 연결하면 보드가 재부팅되고, 블루투스는 재부팅하지 않습니다.';
+}
+
+// 시뮬레이션 고도를 10Hz로 보낸다. 끊기면 보드는 2초 뒤 실제 MTF-01P로 돌아간다.
+setInterval(() => {
+  if (!board.connected) return;
+  const h = calState ? 1.0 : sim.h;
+  send(`simh ${(h * 100).toFixed(1)}`);
+}, 100);
+
+// ---------------------------------------------------------------------------
+// 보정: 태그를 세 곳에 그려 (화면 px → 보드가 본 cm) 대응을 구한다
+//   보드가 본 오프셋 p = R · (d − dc) · (20cm / s)
+//   R: 화면 축 → 카메라 축 (회전·반전), dc: 카메라 광축이 가리키는 화면 위치, s: 태그 한 변(px)
+// ---------------------------------------------------------------------------
+async function runCalibration() {
+  if (calState) return;
+  const wasRunning = sim.running;
+  sim.running = false;
+  const s = ui.K;                          // 1m 고도 크기
+  const delta = Math.round(s * 0.35);
+  const points = [[0, 0], [delta, 0], [0, delta]];
+  const measured = [];
+  calState = { s, d: [0, 0], samples: [], collecting: false };
+  setCalUi('warn', '보정 중', '태그를 움직이며 측정 중…');
+  try {
+    for (let i = 0; i < points.length; i++) {
+      calState.d = points[i];
+      calState.samples = [];
+      calState.collecting = false;
+      setCalUi('warn', `보정 ${i + 1}/3`, '태그 위치를 바꾸고 보드 판단을 기다리는 중…');
+      await sleep(1600);                   // 화면 갱신 + 보드 검출 지연
+      calState.collecting = true;
+      await sleep(1600);
+      calState.collecting = false;
+      if (calState.samples.length < 2) throw new Error('보드가 태그를 보지 못했습니다. 카메라 방향·거리(25~35cm)·화면 밝기를 확인하세요.');
+      measured.push(mean2(calState.samples));
+    }
+    const k = TAG_SIZE_CM / s;             // 화면 px → 태그 기준 cm
+    const c0 = [(measured[1][0] - measured[0][0]) / (delta * k), (measured[1][1] - measured[0][1]) / (delta * k)];
+    const c1 = [(measured[2][0] - measured[0][0]) / (delta * k), (measured[2][1] - measured[0][1]) / (delta * k)];
+    const R = [[c0[0], c1[0]], [c0[1], c1[1]]];
+    const det = R[0][0] * R[1][1] - R[0][1] * R[1][0];
+    if (!isFinite(det) || Math.abs(Math.abs(det) - 1) > 0.4) throw new Error(`측정값이 불안정합니다(배율 ${Math.abs(det).toFixed(2)}). 카메라를 고정하고 다시 시도하세요.`);
+    const Ri = inv2(R);
+    const dc = mul2(Ri, measured[0]).map((v) => -v / k);
+    const angle = Math.atan2(R[1][0], R[0][0]) * 180 / Math.PI;
+    calib = { R, dc, ok: true, angle, det };
+    saveCalib();
+    setCalUi('ok', '보정됨', `카메라 회전 ${angle.toFixed(0)}°, 배율 ${Math.abs(det).toFixed(2)}${det > 0 ? ' (화면 반전)' : ''}, 중심 어긋남 ${Math.hypot(dc[0], dc[1]).toFixed(0)}px`);
+    log(`보정 완료: 회전 ${angle.toFixed(0)}°, 배율 ${Math.abs(det).toFixed(2)}, 중심 (${dc[0].toFixed(0)}, ${dc[1].toFixed(0)})px`);
+  } catch (e) {
+    setCalUi('bad', '보정 실패', e.message);
+    log('보정 실패: ' + e.message);
+  } finally {
+    calState = null;
+    send('mission reset');
+    sim.running = wasRunning;
+  }
+}
+function setCalUi(kind, chip, text) {
+  const c = document.getElementById('calChip');
+  c.className = 'chip ' + kind;
+  c.textContent = chip;
+  document.getElementById('calText').textContent = text;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------------------
+// 물리 (단순화한 쿼드콥터 + INAV 비행 모드 가정)
+// ---------------------------------------------------------------------------
+function activeSticks(now) {
+  if (ui.source === 'board' && board.rc && now - board.rcAt < CFG.fallbackMs) return { ch: board.rc.ch, src: 'board' };
+  return { ch: [1500, 1500, 1500, 1500], src: ui.source === 'board' ? 'fallback' : 'pilot' };
+}
+
+function step(dt, ch) {
+  const ux = stickNorm(ch[0]), uy = stickNorm(ch[1]), uz = stickNorm(ch[2]);
+  const wv = ui.windSpeed / 100, wd = ui.windDir * Math.PI / 180;   // 0° = 앞쪽으로 부는 바람
+  const wx = wv * Math.sin(wd), wy = wv * Math.cos(wd);
+  let desRoll, desPitch, ax = 0, ay = 0;
+
+  if (ui.mode === 'POSHOLD') {
+    // 스틱 = 목표 속도. FC가 위치를 잡으므로 바람은 일부만 남는다.
+    const vxc = ux * CFG.vmax + wx * (1 - CFG.windReject);
+    const vyc = uy * CFG.vmax + wy * (1 - CFG.windReject);
+    ax = (vxc - sim.vx) / CFG.tauV;
+    ay = (vyc - sim.vy) / CFG.tauV;
+    const a = 1 - Math.exp(-dt / CFG.tauV);
+    sim.vx += (vxc - sim.vx) * a;
+    sim.vy += (vyc - sim.vy) * a;
+    desRoll = clamp(Math.atan(ax / G), -CFG.maxTilt, CFG.maxTilt);
+    desPitch = clamp(Math.atan(ay / G), -CFG.maxTilt, CFG.maxTilt);
+  } else {
+    // 스틱 = 목표 기울기. 위치를 잡아 주는 것이 없어 바람에 그대로 밀린다.
+    desRoll = ux * CFG.maxTilt;
+    desPitch = uy * CFG.maxTilt;
+  }
+
+  const at = 1 - Math.exp(-dt / CFG.tauTilt);
+  const r0 = sim.roll, p0 = sim.pitch;
+  sim.roll += (desRoll - sim.roll) * at;
+  sim.pitch += (desPitch - sim.pitch) * at;
+  sim.rollRate = (sim.roll - r0) / dt;
+  sim.pitchRate = (sim.pitch - p0) / dt;
+
+  if (ui.mode === 'ANGLE') {
+    ax = G * Math.tan(sim.roll) - CFG.drag * (sim.vx - wx);
+    ay = G * Math.tan(sim.pitch) - CFG.drag * (sim.vy - wy);
+    sim.vx += ax * dt;
+    sim.vy += ay * dt;
+  }
+  sim.x += sim.vx * dt;
+  sim.y += sim.vy * dt;
+
+  // ALTHOLD 가정: 스로틀 중앙 = 고도 유지, 벗어난 만큼 상승/하강 속도
+  const vzc = uz * CFG.vzmax;
+  const az = (vzc - sim.vz) / CFG.tauZ;
+  sim.vz += (vzc - sim.vz) * (1 - Math.exp(-dt / CFG.tauZ));
+  sim.h = clamp(sim.h + sim.vz * dt, 0.1, 3.0);
+  if (sim.h <= 0.1 && sim.vz < 0) sim.vz = 0;
+
+  // 믹서 (INAV 쿼드 X): 오른쪽으로 기울이려면 왼쪽 모터↑, 앞으로 기울이려면 뒤쪽 모터↑
+  const base = 1000 + (CFG.hoverUs - 1000) * (1 + az / G) / (Math.cos(sim.roll) * Math.cos(sim.pitch));
+  const uR = 500 * (desRoll - sim.roll) - 25 * sim.rollRate;
+  const uP = 500 * (desPitch - sim.pitch) - 25 * sim.pitchRate;
+  sim.motors = [base - uR + uP, base - uR - uP, base + uR + uP, base + uR - uP].map((m) => clamp(m, 1000, 2000));
+}
+
+// ---------------------------------------------------------------------------
+// 화면 속 태그: 드론 카메라에 보일 위치·크기로 그린다
+// ---------------------------------------------------------------------------
+const tagCanvas = document.getElementById('tagCanvas');
+const tctx = tagCanvas.getContext('2d');
+
+function stagePlacement() {
+  if (calState) return { s: calState.s, d: calState.d };
+  const s = ui.K / Math.max(sim.h, 0.05);
+  const q = [-sim.x * 100, -sim.y * 100];          // 드론 기준 착륙 지점 (cm, 오른쪽·앞쪽)
+  const k = s / TAG_SIZE_CM;
+  const v = mul2(inv2(calib.R), [q[0] * k, q[1] * k]);
+  return { s, d: [calib.dc[0] + v[0], calib.dc[1] + v[1]] };
+}
+
+function drawStage() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = tagCanvas.clientWidth, h = tagCanvas.clientHeight;
+  if (tagCanvas.width !== Math.round(w * dpr) || tagCanvas.height !== Math.round(h * dpr)) {
+    tagCanvas.width = Math.round(w * dpr);
+    tagCanvas.height = Math.round(h * dpr);
+  }
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.fillStyle = '#fff';
+  tctx.fillRect(0, 0, tagCanvas.width, tagCanvas.height);
+  const cx = (w / 2) * dpr, cy = (h / 2) * dpr;
+  // 조준용 십자 (옅은 회색, 태그로 오인되지 않음)
+  tctx.fillStyle = '#e5e7eb';
+  tctx.fillRect(cx - 12 * dpr, cy - 0.5 * dpr, 24 * dpr, dpr);
+  tctx.fillRect(cx - 0.5 * dpr, cy - 12 * dpr, dpr, 24 * dpr);
+  if (ui.hideTag && !calState) return;
+
+  const { s, d } = stagePlacement();
+  const cell = (s / 8) * dpr;                       // 검은 정사각형 = 8칸
+  const x0 = cx + d[0] * dpr - 5 * cell, y0 = cy + d[1] * dpr - 5 * cell;
+  const snapPx = (v) => Math.round(v);
+  for (let r = 0; r < 10; r++) {
+    for (let c = 0; c < 10; c++) {
+      tctx.fillStyle = TAG10[r][c] === '1' ? '#fff' : '#000';
+      const xa = snapPx(x0 + c * cell), xb = snapPx(x0 + (c + 1) * cell);
+      const ya = snapPx(y0 + r * cell), yb = snapPx(y0 + (r + 1) * cell);
+      tctx.fillRect(xa, ya, xb - xa, yb - ya);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 위에서 본 지도, 기록 그래프
+// ---------------------------------------------------------------------------
+function fitCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  if (!cv.dataset.h) { cv.dataset.h = cv.getAttribute('height'); cv.style.height = cv.dataset.h + 'px'; }
+  const w = cv.clientWidth, h = +cv.dataset.h;   // CSS 높이는 처음 값으로 고정
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function drawMap() {
+  const { ctx, w, h } = fitCanvas(document.getElementById('mapCanvas'));
+  ctx.clearRect(0, 0, w, h);
+  const span = Math.max(0.5, Math.min(2, Math.max(Math.abs(sim.x), Math.abs(sim.y)) * 1.3));
+  const sc = Math.min(w, h) / 2 / span;            // px per m
+  const ox = w / 2, oy = h / 2;
+  const P = (x, y) => [ox + x * sc, oy - y * sc];
+  ctx.strokeStyle = '#eef0f3';
+  ctx.lineWidth = 1;
+  const stepM = span > 1 ? 0.5 : 0.1;
+  for (let g = -Math.ceil(span / stepM) * stepM; g <= span; g += stepM) {
+    const [gx] = P(g, 0), [, gy] = P(0, g);
+    ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
+  }
+  ctx.fillStyle = '#9aa3af';
+  ctx.font = '11px sans-serif';
+  ctx.fillText(`격자 ${stepM * 100}cm · 위 = 기체 앞쪽`, 6, 14);
+  // 착륙 지점
+  const [tx, ty] = P(0, 0);
+  ctx.strokeStyle = '#dc2626';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(tx - 8, ty); ctx.lineTo(tx + 8, ty); ctx.moveTo(tx, ty - 8); ctx.lineTo(tx, ty + 8); ctx.stroke();
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(tx, ty, Math.max(3, 0.03 * sc), 0, Math.PI * 2); ctx.stroke();
+  // 궤적
+  ctx.strokeStyle = 'rgba(37,99,235,.55)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  trail.forEach((p, i) => { const [px, py] = P(p.x, p.y); if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); });
+  ctx.stroke();
+  // 드론
+  const [dx, dy] = P(sim.x, sim.y);
+  ctx.strokeStyle = '#111827';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(dx - 9, dy - 9); ctx.lineTo(dx + 9, dy + 9); ctx.moveTo(dx + 9, dy - 9); ctx.lineTo(dx - 9, dy + 9); ctx.stroke();
+  ctx.fillStyle = '#111827';
+  for (const [mx, my] of [[-9, -9], [9, -9], [-9, 9], [9, 9]]) { ctx.beginPath(); ctx.arc(dx + mx, dy + my, 3, 0, Math.PI * 2); ctx.fill(); }
+  ctx.fillStyle = '#2563eb';
+  ctx.beginPath(); ctx.moveTo(dx, dy - 15); ctx.lineTo(dx - 4, dy - 9); ctx.lineTo(dx + 4, dy - 9); ctx.fill();
+  // 바람
+  if (ui.windSpeed > 0) {
+    const wd = ui.windDir * Math.PI / 180, L = 26;
+    const bx = w - 40, by = h - 34, ex = bx + Math.sin(wd) * L, ey = by - Math.cos(wd) * L;
+    ctx.strokeStyle = '#d97706';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.beginPath(); ctx.arc(ex, ey, 3, 0, Math.PI * 2); ctx.fillStyle = '#d97706'; ctx.fill();
+    ctx.fillText(`바람 ${ui.windSpeed}cm/s`, w - 92, h - 6);
+  }
+}
+
+function drawPlot(id, key, lines, maxDefault, color) {
+  const { ctx, w, h } = fitCanvas(document.getElementById(id));
+  ctx.clearRect(0, 0, w, h);
+  const now = performance.now();
+  const pts = hist.filter((p) => now - p.t < 30000);
+  const maxV = Math.max(maxDefault, ...pts.map((p) => p[key]).filter(isFinite)) * 1.1;
+  const Y = (v) => h - 6 - (v / maxV) * (h - 12);
+  const X = (t) => w - ((now - t) / 30000) * w;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = '#c4c9d1';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#9aa3af';
+  ctx.font = '10px sans-serif';
+  for (const v of lines) { ctx.beginPath(); ctx.moveTo(0, Y(v)); ctx.lineTo(w, Y(v)); ctx.stroke(); ctx.fillText(String(v), 4, Y(v) - 2); }
+  ctx.setLineDash([]);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  pts.forEach((p, i) => { const x = X(p.t), y = Y(p[key]); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+  ctx.stroke();
+}
+
+// ---------------------------------------------------------------------------
+// 패널 갱신
+// ---------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+function setStick(knobId, valId, us) {
+  const n = clamp((us - 1500) / 500, -1, 1);
+  const k = $(knobId);
+  k.style.left = (n < 0 ? 50 + n * 50 : 50) + '%';
+  k.style.width = Math.abs(n) * 50 + '%';
+  $(valId).textContent = us;
+}
+
+function updatePanel(src, ch) {
+  const now = performance.now();
+  const srcChip = $('srcChip');
+  srcChip.textContent = { board: '입력: 보드(MSP)', fallback: '입력: 조종기(보드 신호 끊김)', pilot: '입력: 조종기' }[src];
+  srcChip.className = 'chip ' + (src === 'board' ? 'ok' : src === 'fallback' ? 'warn' : '');
+  const phase = board.rc ? board.rc.phase : board.phase;
+  $('phaseChip').textContent = PHASE_KO[phase] || phase;
+
+  const t = board.target, fresh = t && now - board.targetAt < 1500;
+  if (!board.connected) { $('decBig').textContent = '보드 연결 대기'; $('decMove').textContent = '—'; $('decNext').textContent = '—'; }
+  else if (fresh) {
+    $('decBig').textContent = t.decision === 'OVER_TARGET' ? '착륙 지점 바로 위' : '이동 필요';
+    $('decMove').textContent = '이동: ' + t.move_ko;
+    $('decNext').textContent = '다음: ' + t.next_ko;
+  } else {
+    $('decBig').textContent = '태그 안 보임';
+    $('decMove').textContent = '스틱 중립(1500)';
+    $('decNext').textContent = ui.hideTag ? '태그 가리기 켜짐' : '카메라가 화면을 보는지, 태그가 화면 밖으로 나갔는지 확인';
+  }
+
+  const errCm = Math.hypot(sim.x, sim.y) * 100;
+  $('vH').textContent = (sim.h * 100).toFixed(1) + 'cm';
+  $('vErr').textContent = errCm.toFixed(1) + 'cm';
+  $('vPerc').textContent = board.perc == null ? '—' : board.perc.toFixed(1) + 'cm';
+  const v = board.vision;
+  $('vFps').textContent = v ? `${v.fps.toFixed(1)} · ${v.detect_ms}ms` : '—';
+  $('vDec').textContent = v ? `${v.decimate_used.toFixed(1)} (${v.dec_mode})` : '—';
+  $('vAge').textContent = t ? ((now - board.targetAt) / 1000).toFixed(1) + 's' : '—';
+
+  setStick('kRoll', 'sRoll', ch[0]);
+  setStick('kPitch', 'sPitch', ch[1]);
+  setStick('kThr', 'sThr', ch[2]);
+  ['M1', 'M2', 'M3', 'M4'].forEach((m, i) => {
+    const us = Math.round(sim.motors[i]);
+    $('v' + m).textContent = us;
+    $('f' + m).style.height = ((us - 1000) / 10) + '%';
+  });
+  updateConnUi();
+}
+
+// ---------------------------------------------------------------------------
+// 메인 루프
+// ---------------------------------------------------------------------------
+let lastT = performance.now(), lastPanel = 0, lastHist = 0, lastSrc = '';
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  const { ch, src } = activeSticks(now);
+  if (src !== lastSrc) { if (lastSrc) log({ board: '입력 → 보드(MSP)', fallback: '보드 신호 끊김 → INAV가 조종기 입력으로 복귀', pilot: '입력 → 조종기' }[src]); lastSrc = src; }
+  if (sim.running && !calState) {
+    for (let i = 0; i < 4; i++) step(dt / 4, ch);
+    if (now - lastHist > 50) {
+      lastHist = now;
+      hist.push({ t: now, h: sim.h * 100, err: Math.hypot(sim.x, sim.y) * 100 });
+      trail.push({ t: now, x: sim.x, y: sim.y });
+      while (hist.length && now - hist[0].t > 30000) hist.shift();
+      while (trail.length && now - trail[0].t > 10000) trail.shift();
+    }
+  }
+  drawStage();
+  if (now - lastPanel > 100) {
+    lastPanel = now;
+    updatePanel(src, ch);
+    drawMap();
+    drawPlot('plotH', 'h', [50, 100], 130, '#2563eb');
+    drawPlot('plotE', 'err', [3], 20, '#d97706');
+  }
+  requestAnimationFrame(frame);
+}
+
+function resetSim() {
+  const r = 0.12 + Math.random() * 0.13, a = Math.random() * Math.PI * 2;
+  Object.assign(sim, { x: r * Math.cos(a), y: r * Math.sin(a), vx: 0, vy: 0, h: 1.2, vz: 0, roll: 0, pitch: 0, rollRate: 0, pitchRate: 0 });
+  hist.length = 0;
+  trail.length = 0;
+  board.perc = null;
+  send('mission reset');
+  log(`리셋: 착륙 지점에서 ${(r * 100).toFixed(0)}cm 떨어진 곳, 고도 120cm`);
+}
+
+// ---------------------------------------------------------------------------
+// 버튼
+// ---------------------------------------------------------------------------
+$('btnConnect').onclick = () => (board.connected ? disconnect() : connect());
+$('btnBle').onclick = () => (board.connected ? disconnect() : connectBle());
+$('btnSnap').onclick = () => { send('snap'); log('카메라 화면 요청'); };
+$('btnSnapClose').onclick = () => { $('snapModal').style.display = 'none'; };
+$('btnCalib').onclick = runCalibration;
+$('btnRun').onclick = () => {
+  sim.running = !sim.running;
+  $('btnRun').textContent = sim.running ? '일시정지' : '시작';
+  log(sim.running ? '시뮬레이션 시작' : '일시정지');
+};
+$('btnReset').onclick = resetSim;
+$('modeSel').onchange = (e) => { ui.mode = e.target.value; log('비행 모드: ' + ui.mode); };
+$('btnSource').onclick = () => {
+  ui.source = ui.source === 'board' ? 'pilot' : 'board';
+  $('btnSource').textContent = ui.source === 'board' ? '조종권: 보드' : '조종권: 조종기';
+  $('btnSource').classList.toggle('on', ui.source === 'board');
+};
+$('btnMsp').onclick = () => {
+  ui.mspOff = !ui.mspOff;
+  send(ui.mspOff ? 'msp off' : 'msp on');
+  $('btnMsp').classList.toggle('on', ui.mspOff);
+  $('btnMsp').textContent = ui.mspOff ? '보드 MSP 다시 켜기' : '보드 MSP 끊기';
+  log(ui.mspOff ? '보드 MSP 송신 끔 (보드 멈춤 상황)' : '보드 MSP 송신 켬');
+};
+$('btnHide').onclick = () => {
+  ui.hideTag = !ui.hideTag;
+  $('btnHide').classList.toggle('on', ui.hideTag);
+  log(ui.hideTag ? '태그 가림' : '태그 다시 보임');
+};
+$('btnGust').onclick = () => {
+  const a = Math.random() * Math.PI * 2;
+  sim.vx += 0.5 * Math.cos(a);
+  sim.vy += 0.5 * Math.sin(a);
+  log('돌풍: 50cm/s 순간 밀림');
+};
+function bindSlider(id, valId, fmt, apply) {
+  const el = $(id), out = $(valId);
+  const upd = () => { apply(+el.value); out.textContent = fmt(+el.value); };
+  el.oninput = upd;
+  upd();
+}
+$('kSlider').value = ui.K;
+bindSlider('kSlider', 'kVal', (v) => v + 'px', (v) => { ui.K = v; try { localStorage.setItem('tagsim.K', v); } catch (e) {} });
+bindSlider('windSpeed', 'windSpeedVal', (v) => v + 'cm/s', (v) => { ui.windSpeed = v; });
+bindSlider('windDir', 'windDirVal', (v) => v + '°', (v) => { ui.windDir = v; });
+if (calib.ok) setCalUi('ok', '보정됨(저장값)', `카메라 회전 ${(calib.angle || 0).toFixed(0)}° — 카메라를 옮겼다면 다시 보정하세요`);
+if ('serial' in navigator) navigator.serial.addEventListener('disconnect', () => { if (board.connected) { log('USB 연결 해제됨'); disconnect(); } });
+
+resetSim();
+log('준비 완료 — 보드 연결 → 자동 보정 → 시작 순서로 진행하세요');
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

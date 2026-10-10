@@ -1,0 +1,216 @@
+#pragma once
+#include <stdint.h>
+
+// ---------------------------------------------------------------------------
+// 빌드 식별자 (부팅 메시지에 출력)
+// ---------------------------------------------------------------------------
+#define FW_BUILD "TAGVISION-20261010-21"
+
+// ---------------------------------------------------------------------------
+// MTF-01P (115200 8N1, 100Hz) — Micolink·MSP(INAV 출력) 자동 구분. 기존 RIDER-SERIAL 펌웨어와 같은 핀
+// ---------------------------------------------------------------------------
+#define MTF_RX_PIN 44  // XIAO D7 ← MTF-01P TX
+#define MTF_TX_PIN 43  // XIAO D6 → MTF-01P RX
+#define MTF_BAUD 115200
+#define FLOW_REPORT_MS 200      // flow JSON 출력 주기 (5Hz)
+#define FLOW_STALE_MS 300       // 이 시간 동안 패킷이 없으면 connected=false
+
+// ---------------------------------------------------------------------------
+// FC 연결 (MSP over UART) — MicoAir H743 V2 의 UART5 커넥터
+// XIAO D0(GPIO1) → RX5, XIAO D1(GPIO2) ← TX5, GND 공통. INAV Ports 탭에서 UART5 MSP 켜기
+// ---------------------------------------------------------------------------
+#define FC_TX_PIN 1             // XIAO D0 → FC RX5
+#define FC_RX_PIN 2             // XIAO D1 ← FC TX5
+#define FC_BAUD 115200          // INAV MSP 기본 속도
+#define MSP_ENABLED_DEFAULT true
+#define MSP_SEND_HZ 20          // INAV는 5Hz 이상을 요구 (docs/Rx.md)
+#define MSP_POLL_EVERY 4        // SET_RAW_RC 4번마다 MSP_RC 한 번 요청 → FC가 실제 받은 채널 확인
+#define MSP_LINK_TIMEOUT_MS 1000
+#define MSP_CHANNELS 8          // 롤·피치·스로틀·요 + AUX 4개 (AUX는 INAV 마스크에 넣지 않으면 무시됨)
+
+// MSP 프레임의 채널 위치. 수신기와 같은 순서(INAV Channel Map)여야 한다. INAV 기본 AETR 기준.
+#define MSP_CH_ROLL 0
+#define MSP_CH_PITCH 1
+#define MSP_CH_THROTTLE 2
+#define MSP_CH_YAW 3
+
+// 킬(정지) 채널: 보드가 이 채널을 KILL_ON_US로 보내면 INAV FAILSAFE 모드(DROP)가 켜져 즉시 디스아밍된다.
+// 20261010 FC 설정 기준: ch5=ARM, ch6=MSP RC OVERRIDE(900~1700, 스위치 올림), ch8=ANGLE(항상).
+// 그래서 킬은 ch7(인덱스 6). INAV 설정 필요: aux 3 27 2 1700 2100 / set msp_override_channels = 64
+// 보드 조종(ch6 올림)이 켜져 있을 때만 동작한다. 보드는 끌 수만 있고 아밍은 못 한다.
+#define MSP_CH_KILL 6
+#define KILL_ON_US 2000
+#define KILL_OFF_US 1000
+
+// FC 상태 읽기: 20Hz 주기 중 이 간격마다 상태·배터리·모터 출력을 번갈아 요청 (각 2Hz)
+#define FC_POLL_PERIOD 10
+
+// 높이: 20261010부터 MTF-01P는 FC UART4에 연결한다(INAV rangefinder·opflow = MSP).
+// 보드에 MTF-01P 데이터가 직접 들어오지 않으면 FC의 거리센서 값(MSP_SONAR_ALTITUDE, cm)을 대신 쓴다.
+// 20Hz 주기 중 이 간격마다 한 번 요청 → 2 = 10Hz
+#define FC_ALT_POLL_EVERY 2
+
+// 착륙 지점 오프셋(cm) → 스틱 값(µs). 1500 중립에서 ±만큼 움직인다.
+// INAV 쪽 비행 모드에 따라 의미가 다르다: ANGLE은 기울기, POSHOLD는 속도 명령.
+#define CTRL_XY_US_PER_CM 4.0f  // 1cm 벗어나면 4µs
+#define CTRL_XY_MAX_US 80       // 최대 ±80µs (전체 ±500의 16%)
+#define CTRL_TARGET_STALE_MS 1000 // 이 시간 동안 새 판단이 없으면 중립
+
+// 스로틀(고도) 제어: INAV ALTHOLD처럼 "스로틀 중앙 = 고도 유지" 모드에서만 안전하다.
+// false면 스로틀은 항상 1500을 보낸다. INAV msp_override_channels에 스로틀 비트를 넣지 말 것.
+#define CTRL_THROTTLE_ENABLED false
+#define CTRL_Z_US_PER_CM 3.0f
+#define CTRL_Z_MAX_US 60
+
+// 미션 단계 (노션 20261001): 정렬 → 50cm 하강 → 3초 유지 → 100cm 상승 → 호버링
+#define MISSION_LOW_CM 50.0f
+#define MISSION_HIGH_CM 100.0f
+#define MISSION_HOLD_MS 3000
+#define MISSION_BAND_CM 5.0f    // 목표 고도 ± 이 범위면 도달로 본다
+
+// 모터 시험 (`motortest`): FC가 아밍되지 않았을 때 MSP_SET_MOTOR로 모터를 직접 돌린다.
+// 프로펠러를 반드시 뗀 상태에서만 쓴다. 시간이 지나면 보드가 스스로 정지 신호를 보낸다(BLE가 끊겨도).
+#define MOTOR_TEST_MAX_PCT 15     // 출력 상한 (1000 + 15% = 1150)
+#define MOTOR_TEST_MAX_MS 5000    // 한 번에 최대 5초
+#define MOTOR_COUNT 4
+
+// 시뮬레이션 모드: 브라우저(sim/index.html)가 `simh <cm>`로 가상 고도를 보내는 동안
+// MTF-01P 높이 대신 그 값을 쓰고, 스틱 값을 USB로 20Hz `rc` 메시지로 내보낸다.
+// 이 시간 동안 simh가 없으면 자동으로 실제 센서로 돌아간다.
+#define SIM_TIMEOUT_MS 2000
+
+// ---------------------------------------------------------------------------
+// 마이크 INMP441 (I2S). VDD→3.3V, GND→GND, L/R→GND(왼쪽 채널)
+// ---------------------------------------------------------------------------
+#define MIC_SCK_PIN 4             // D3 ← INMP441 SCK(BCLK)
+#define MIC_WS_PIN 5              // D4 ← INMP441 WS(LRCLK)
+#define MIC_SD_PIN 6              // D5 ← INMP441 SD(데이터)
+#define MIC_RATE 16000            // 음성 인식 표준 16kHz
+#define MIC_GAIN 16               // 24비트 → 16비트 변환 시 이득 (×16 = +24dB). 소리가 작으면 올린다
+#define MIC_REPORT_MS 1000        // 소리 크기 보고 주기
+#define MIC_MAX_REC_MS 3000       // 한 번 녹음 최대 3초
+
+// ---------------------------------------------------------------------------
+// 음성 명령: 인식기(PC 한국어 인식 또는 보드 키워드 모델)가 알아들은 키워드를
+// `voicecmd <키워드>`로 넘기면 아래 명령을 차례로 실행한다(세미콜론으로 구분).
+// 안전: 모터 시험·아밍처럼 기체를 움직이는 명령은 넣지 않는다 (펌웨어가 motortest·voicecmd는 거부).
+// ---------------------------------------------------------------------------
+struct VoiceCommand {
+  const char *keyword;   // 인식기가 보내는 이름
+  const char *ko;        // 사람이 말할 말 (인식기 학습·안내용)
+  const char *commands;  // 실행할 보드 명령
+};
+
+static const VoiceCommand VOICE_COMMANDS[] = {
+  {"stop", "정지 / 멈춰", "motorstop;msp off"},  // 모터 시험 중지 + 보드 조종 해제(조종기로)
+  {"resume", "다시 시작", "msp on"},
+  {"status", "상태", "info"},
+  {"snap", "사진", "snap"},
+  {"mission_reset", "미션 처음부터", "mission reset"},
+  {"cam_down", "카메라 아래", "cam down"},
+  {"cam_front", "카메라 앞", "cam front"},
+};
+
+// ---------------------------------------------------------------------------
+// 카메라 (XIAO ESP32S3 Sense 확장 모듈)
+// ---------------------------------------------------------------------------
+// VGA 그레이스케일. 더 빠르게 하려면 FRAMESIZE_HVGA(480x320), 더 멀리 보려면 FRAMESIZE_SVGA.
+#define CAM_FRAMESIZE FRAMESIZE_VGA
+// 수평 화각: OV2640 대각 66° 를 4:3 으로 환산한 55°. 20261003 실측(태그 304px ↔ MTF-01P 41cm)과 일치
+#define CAM_HFOV_DEG 55.0f
+
+// ---------------------------------------------------------------------------
+// 카메라 팬·틸트 (서보 2개, 50Hz PWM) — 20261010 요청: 운행 중 카메라 방향 전환
+// 각도 규약 (기체 기준): 팬 0° = 앞, + = 오른쪽. 틸트 0° = 바로 아래(기존 장착 자세), + = 앞으로 들어 올림, 90° = 정면 수평.
+// 기계 구조 가정: 아래 서보가 팬(수직축), 그 위 서보가 틸트. 계산은 src/gimbal_geom.h.
+// 서보 전원: FC 5V (LED·BUZZER 또는 GPS 커넥터의 5V·GND). XIAO 3V3에 연결하지 않는다. GND는 공통.
+// 서보가 없는 고정 장착이면 GIMBAL_ENABLED false → 항상 팬 0°·틸트 0°로 계산한다.
+// ---------------------------------------------------------------------------
+#define GIMBAL_ENABLED true
+#define GIMBAL_PAN_PIN 7              // XIAO D8 → 팬 서보 신호
+#define GIMBAL_TILT_PIN 8             // XIAO D9 → 틸트 서보 신호
+#define GIMBAL_PAN_LEDC_CH 2          // LEDC 채널 2·3 = 타이머 1 (카메라 XCLK가 타이머 0·채널 0을 씀)
+#define GIMBAL_TILT_LEDC_CH 3
+#define GIMBAL_PWM_HZ 50
+#define GIMBAL_PWM_BITS 14            // ESP32-S3 LEDC 최대 해상도 (20ms / 16384 ≈ 1.2µs)
+#define GIMBAL_US_MIN 500             // 서보에 보낼 펄스 한계
+#define GIMBAL_US_MAX 2500
+// 장착 보정: `cam us <팬µs> <틸트µs>`로 실제 0° 위치(앞·바로 아래)의 펄스를 찾아 넣는다
+#define GIMBAL_PAN_CENTER_US 1500     // 팬 0°
+#define GIMBAL_TILT_DOWN_US 1500      // 틸트 0°
+#define GIMBAL_PAN_US_PER_DEG 10.0f   // 표준 서보 약 10µs/°. 돌아가는 방향이 반대면 음수로
+#define GIMBAL_TILT_US_PER_DEG 10.0f
+#define GIMBAL_PAN_MIN_DEG -90.0f
+#define GIMBAL_PAN_MAX_DEG 90.0f
+#define GIMBAL_TILT_MIN_DEG -30.0f
+#define GIMBAL_TILT_MAX_DEG 90.0f
+#define GIMBAL_FRONT_TILT_DEG 60.0f   // `cam front`: 앞쪽 30° 아래를 봄 (멀리 있는 태그 찾기)
+#define GIMBAL_SLEW_DEG_S 120.0f      // 최대 회전 속도 (급하게 돌면 영상이 번짐)
+#define GIMBAL_UPDATE_HZ 50
+#define GIMBAL_SETTLE_MS 250          // 멈춘 뒤 이 시간이 지나야 그 각도로 계산한 위치를 제어에 쓴다
+#define GIMBAL_OBLIQUE_DEG 20.0f      // 틸트가 이보다 크면 태그 크기 대신 높이로 지면 교점을 구한다
+#define GIMBAL_MIN_DOWN 0.17f         // 광선이 수평 아래 10°보다 얕으면 지면 교점을 쓰지 않음
+
+// ---------------------------------------------------------------------------
+// AprilTag
+// ---------------------------------------------------------------------------
+#define TAG_FAMILY_NAME "tag36h11"
+#define TAG_NTHREADS 2
+#define TAG_MIN_MARGIN 30.0f    // decision_margin이 이보다 낮으면 오인식 가능성으로 보고 버림
+#define TAG_UNKNOWN_SIZE_MM 200 // 표에 없는 태그의 거리·오프셋 계산용 가정값
+
+// ---------------------------------------------------------------------------
+// decimate 자동 전환
+// decimate가 클수록 빠르지만 작은(먼) 태그를 놓친다. 20261003 실측(VGA):
+//   2.0 ≈ 640ms, 3.0 ≈ 150~290ms, 4.0 ≈ 100~160ms
+// PC 시뮬레이션에서 인식 가능한 최소 크기는 축소 후 한 변 9~11px.
+// 실제 흔들림·기울기를 감안해 그 2배인 20px 이상이 되도록 고른다.
+// ---------------------------------------------------------------------------
+#define DEC_AUTO_DEFAULT true
+#define DEC_START 3.0f          // 부팅 직후 값
+#define DEC_KEEP_SIDE_PX 20.0f  // 축소 후 한 변이 이보다 작아지면 decimate를 낮춘다
+#define DEC_RAISE_SIDE_PX 24.0f // 올릴 때는 여유를 더 둔다 (경계에서 왕복 전환 방지)
+#define DEC_LOST_FRAMES 2       // 태그를 이만큼 연속으로 놓치면 MTF-01P 높이로 크기를 예측
+#define DEC_SWEEP_EVERY 4       // 놓친 상태에서 이 프레임마다 한 번은 2.0으로 넓게 찾는다
+
+// 착륙 지점이 화면 중앙에서 이 거리(cm) 안이면 "착륙 지점 바로 위"로 판단
+#define CENTER_TOL_CM 3.0f
+
+// 카메라 영상 → 기체 축 매핑 (카메라가 아래를 보고, 화면 위쪽이 기체 앞쪽이라고 가정)
+// 장착 방향을 실측하기 전까지 axes_verified=false 로 출력한다.
+#define CAM_ROTATE_DEG 0        // 0 / 90 / 180 / 270
+#define AXES_VERIFIED false
+
+// ---------------------------------------------------------------------------
+// 태그 표: ID → 크기·착륙 지점·의미
+// AprilTag 자체에는 ID 숫자만 들어 있다. 의미와 크기는 이 표에서 정한다.
+//
+// size_mm  : 검은 정사각형 한 변 (흰 여백 제외)
+// land_x/y : 이 태그 중심에서 착륙 지점까지 거리(mm). 인쇄물을 글자 읽듯 똑바로 놓고 봤을 때
+//            오른쪽 +x, 위쪽 +y. 태그 중심이 곧 착륙 지점이면 0, 0.
+//
+// 중첩 태그: 큰 태그는 멀리서, 작은 태그는 가까이서 보인다. 두 태그의 land_x/y를
+// 같은 물리적 지점을 가리키게 맞추면, 어느 태그가 보이든 같은 착륙 지점으로 안내한다.
+// 시리얼 `size <id> <mm>`, `land <id> <x> <y>`로 재빌드 없이 바꿀 수 있다(NVS 저장).
+// ---------------------------------------------------------------------------
+struct TagInfo {
+  int id;
+  uint16_t size_mm;
+  int16_t land_x_mm;
+  int16_t land_y_mm;
+  const char *code;
+  const char *ko;
+};
+
+#define MISSION_KO "미션 목표 지점: 착륙 지점 위로 이동 → 바닥 기준 50cm에서 3초 유지 → 100cm로 복귀 후 호버링"
+
+static const TagInfo TAG_TABLE[] = {
+  // 노션 계획서(20261001): 첫 시험 태그 ID 0, 한 변 100mm → 저고도용 작은 태그
+  {0, 100, 0, 0, "MISSION_TARGET", MISSION_KO},
+  // 20261003: 제작한 200mm 패널 ID 10 → 고고도용 큰 태그. 작은 태그 옆에 두면 land_x/y를 설정
+  {10, 200, 0, 0, "MISSION_TARGET", MISSION_KO},
+};
+
+static const TagInfo TAG_UNASSIGNED = {
+  -1, TAG_UNKNOWN_SIZE_MM, 0, 0, "UNASSIGNED", "의미 미지정 태그: config.h의 TAG_TABLE에 ID를 등록해야 함"
+};

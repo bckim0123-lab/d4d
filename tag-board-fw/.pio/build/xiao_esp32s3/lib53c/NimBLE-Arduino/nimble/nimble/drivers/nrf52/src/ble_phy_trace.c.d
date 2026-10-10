@@ -1,0 +1,2 @@
+.pio/build/xiao_esp32s3/lib53c/NimBLE-Arduino/nimble/nimble/drivers/nrf52/src/ble_phy_trace.c.o: \
+ .pio/libdeps/xiao_esp32s3/NimBLE-Arduino/src/nimble/nimble/drivers/nrf52/src/ble_phy_trace.c
