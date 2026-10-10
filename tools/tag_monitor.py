@@ -203,9 +203,44 @@ def fmt_msp(o):
         fc_names = ["롤", "피치", "요", "스로틀", "AUX1", "AUX2", "AUX3", "AUX4"]
         fc = " | FC가 쓰는 값: " + " ".join(f"{n}={v}" for n, v in zip(fc_names, o["fc_rc"]))
     thr = "" if o["throttle_ctrl"] else " (스로틀 제어 꺼짐)"
+    # -25: 50Hz 상시 송신, rcmap·마스크 확인, 핸드오버 기준점, MTF vz
+    extra = ""
+    if "tx_hz" in o:
+        slot = o.get("thr_slot")
+        if slot is not None and rc_tx and len(o.get("out", [])) > slot:
+            out_vals = o["out"]
+            rcmap = o.get("rcmap", "AETR")
+            letter_to_name = {"A": "롤", "E": "피치", "R": "요", "T": "스로틀"}
+            out = " ".join(f"{letter_to_name.get(ch, ch)}={v}" for ch, v in zip(rcmap, out_vals))
+        mask = o.get("fc_mask")
+        mask_ok = o.get("mask_ok")
+        mask_text = ("미확인" if mask is None else
+                     f"{mask}{' OK' if mask_ok else ' ⚠스로틀 비트/롤·피치 누락 → set msp_override_channels = ' + str(o.get('mask_recommended', 7))}")
+        vz = o.get("vz_cm_s")
+        vz_text = "없음" if vz is None else f"{vz:+.1f}cm/s{' ⚠>10' if o.get('vz_warn') else ''}"
+        base = o.get("base_rpy")
+        extra = (f" | 송신율 {o['tx_hz']}Hz{'(상시)' if o.get('tx_always') else ''}"
+                 f" · rcmap {o.get('rcmap')}({o.get('rcmap_src')}) · FC 마스크 {mask_text}"
+                 f" · 기준점 {base} · vz {vz_text}")
     return (f"[MSP→FC] {link} · 제어권 {authority_text} · RC 송신 {'중' if rc_tx else '정지'}"
             f" · 보냄 {o['sent']} 응답 {o['acks']} 오류 {o['errors']} | 송신: {out}{thr}{fc}"
-            f" | 단계 {PHASE_KO.get(o['phase'], o['phase'])}")
+            f" | 단계 {PHASE_KO.get(o['phase'], o['phase'])}{extra}")
+
+
+def fmt_authority(o):
+    age = o.get("frame_age_ms")
+    age_text = "프레임 없음" if age is None or age < 0 else f"마지막 프레임 {age}ms 전"
+    return (f"[CH6 전환] → {'AUTO' if o['to'] == 'auto' else 'MANUAL'} (CH6={o.get('ch6')}) @ {o.get('t')}ms"
+            f" · {age_text} · 송신율 {o.get('tx_hz')}Hz · 보내던 롤/피치/요 {o.get('out_rpy')}"
+            f" · 조종기 롤/피치/요 {o.get('pilot_rpy')}{'' if o.get('pilot_valid') else '(미확인)'}"
+            f" · 스로틀 슬롯 {o.get('thr_slot_us')} · FC 값 {o.get('fc_rc')} · 접근 {o.get('approach')}")
+
+
+def fmt_warn(o):
+    if o.get("code") == "vz":
+        return (f"[경고] MTF 수직 속도 {o['vz_cm_s']:+.1f}cm/s (한계 {o['limit_cm_s']:.0f})"
+                f" · 높이 {o.get('height_cm')}cm({o.get('height_src')}) · 스로틀 조작 없음")
+    return f"[경고] {o}"
 
 
 DEC_REASON = {
@@ -270,6 +305,10 @@ def monitor(lines, raw, flow_every, deadline):
                 print(fmt_vision(o), flush=True)
         elif t in ("boot", "info"):
             print(fmt_boot(o), flush=True)
+        elif t == "authority":
+            print(fmt_authority(o), flush=True)
+        elif t == "warn":
+            print(fmt_warn(o), flush=True)
         else:
             print(line, flush=True)
 

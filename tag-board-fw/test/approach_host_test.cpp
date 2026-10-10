@@ -104,6 +104,8 @@ static void testFaults() {
     {"flow_stale", [](ApproachInput &i) { i.velAtMs = i.nowMs - 1000; }, "flow"},
     {"flow_invalid", [](ApproachInput &i) { i.velValid = false; }, "flow"},
     {"velocity", [](ApproachInput &i) { i.velFwdCmS = 90; }, "velocity"},
+    {"mask_unknown", [](ApproachInput &i) { i.maskKnown = false; }, "mask_unknown"},
+    {"mask_throttle", [](ApproachInput &i) { i.maskOk = false; }, "mask"},
   };
   for (const Case &k : cases) {
     ApproachController c;
@@ -134,6 +136,7 @@ static void testFaults() {
 
 static void testTagLostBrakes() {
   ApproachController c;
+  c.p.lostNeutral = 0;  // 광류 제동 방식 (lost_neutral 0)
   ApproachInput in = healthy(0);
   in.errFwdCm = 100;
   ApproachOutput o;
@@ -161,6 +164,82 @@ static void testTagLostBrakes() {
   }
   NEAR(o.vTargetFwdCmS, 0.0f, 1e-3f);
   CHECK(o.pitchUs < -10.0f);  // 측정 속도 +10 → 오차 -10 → 제동 명령
+}
+
+// 엔지니어 시험 사양(기본값): 태그 유실 → 즉시 중립 복귀, 광류 제동 없음. 명령은 변화율 한계로 0 에 수렴
+static void testTagLostNeutral() {
+  ApproachController c;
+  ApproachInput in = healthy(0);
+  in.errFwdCm = 100;
+  ApproachOutput o;
+  for (int i = 0; i < 40; i++) {
+    in.nowMs += 50;
+    in.tagAtMs = in.velAtMs = in.heightAtMs = in.nowMs;
+    o = c.step(in, 0.05f);
+  }
+  CHECK(o.pitchUs > 5.0f);
+  in.velFwdCmS = 10;  // 아직 10cm/s 로 움직이는 중이어도
+  for (int i = 0; i < 20; i++) {
+    in.nowMs += 50;
+    in.velAtMs = in.heightAtMs = in.nowMs;  // tagAtMs 그대로 → stale
+    o = c.step(in, 0.05f);
+  }
+  CHECK(o.state == ApproachState::Hold);
+  CHECK(o.fault && strcmp(o.fault, "tag_lost") == 0);
+  CHECK(o.neutral);
+  NEAR(o.vTargetFwdCmS, 0.0f, 1e-4f);
+  CHECK(o.pitchUs >= 0.0f);  // 제동(음수) 명령을 만들지 않는다
+  for (int i = 0; i < 40; i++) {
+    in.nowMs += 50;
+    in.velAtMs = in.heightAtMs = in.nowMs;
+    o = c.step(in, 0.05f);
+  }
+  NEAR(o.pitchUs, 0.0f, 1e-3f);
+  NEAR(o.rollUs, 0.0f, 1e-3f);
+}
+
+// deadband(정지 반경) 안에 들어오면 롤·피치를 중립으로. 밖으로 나가면 다시 접근
+static void testDeadbandNeutral() {
+  ApproachController c;
+  c.p.cmdSlewUsPerS = 10000;
+  ApproachInput in = healthy(0);
+  in.errFwdCm = 4;    // 5cm 안
+  in.velFwdCmS = 6;   // 아직 움직이는 중 → 속도 유지 모드라면 제동 명령이 나왔을 것
+  ApproachOutput o = c.step(in, 0.05f);
+  CHECK(o.state == ApproachState::Arriving);
+  CHECK(o.neutral);
+  NEAR(o.pitchUs, 0.0f, 1e-4f);
+  NEAR(o.rollUs, 0.0f, 1e-4f);
+  // 비교: deadband_neutral 0 이면 속도 0 유지를 위해 제동한다
+  ApproachController c2;
+  c2.p.deadbandNeutral = 0;
+  c2.p.cmdSlewUsPerS = 10000;
+  o = c2.step(in, 0.05f);
+  CHECK(!o.neutral);
+  CHECK(o.pitchUs < -5.0f);
+  // 다시 밖으로 밀려나면 접근 재개
+  in.errFwdCm = 15;
+  in.velFwdCmS = 0;
+  o = c.step(in, 0.05f);
+  CHECK(!o.neutral);
+  CHECK(o.targetSpeedCmS > 0);
+}
+
+// 실측 수평 속도가 overspeed 를 넘으면 목표 속도를 0 으로 (0.10 m/s 상한 보강)
+static void testOverspeed() {
+  ApproachController c;
+  c.p.maxAccelCmS2 = 1000;
+  ApproachInput in = healthy(0);
+  in.errFwdCm = 100;
+  in.velFwdCmS = 15;  // > 12
+  ApproachOutput o = c.step(in, 0.05f);
+  CHECK(o.overspeed);
+  NEAR(o.vTargetFwdCmS, 0.0f, 1e-4f);
+  CHECK(o.pitchUs < 0);  // 제동
+  in.velFwdCmS = 8;
+  o = c.step(in, 0.05f);
+  CHECK(!o.overspeed);
+  CHECK(o.vTargetFwdCmS > 0);
 }
 
 static void testArrival() {
@@ -204,6 +283,7 @@ static void testArrival() {
 static void testSim1D() {
   ApproachController c;
   c.p.velKpUsPerCmS = 2.0f;
+  c.p.deadbandNeutral = 0;  // 마찰 없는 1D 모델에서는 속도 0 유지 방식으로 정지 특성을 본다
   const float kAcc = 1.0f;      // 1µs ≈ 0.06° ≈ 1 cm/s² (ANGLE 30°/500µs 가정)
   const float tau = 0.3f;
   float pos = 0, vel = 0, acc = 0;  // 기체 위치·속도(앞 방향)
@@ -246,6 +326,11 @@ static void testParams() {
   int n = approachParamsJson(p, buf, sizeof(buf));
   CHECK(n > 0 && n < (int)sizeof(buf));
   CHECK(strstr(buf, "\"max_speed\":7.0") != nullptr);
+  CHECK(approachSetParam(p, "deadband_neutral", 0));
+  NEAR(p.deadbandNeutral, 0.0f, 1e-6f);
+  CHECK(approachSetParam(p, "handover_slew", 50));
+  NEAR(p.handoverSlewUsPerS, 50.0f, 1e-6f);
+  CHECK(strstr(buf, "\"lost_neutral\":1") != nullptr);
 }
 
 int main() {
@@ -255,6 +340,9 @@ int main() {
   testCmdMax();
   testFaults();
   testTagLostBrakes();
+  testTagLostNeutral();
+  testDeadbandNeutral();
+  testOverspeed();
   testArrival();
   testSim1D();
   testParams();

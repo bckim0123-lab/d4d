@@ -51,6 +51,12 @@ struct ApproachParams {
   float attPitchSign = 1.0f;
   float camOffsetRightCm = 0;    // 카메라 중심 → 기체 무게중심 (cm). 카메라가 왼쪽에 있으면 +
   float camOffsetFwdCm = 0;      // 카메라가 뒤에 있으면 +
+
+  // ---- 수동 스로틀 유지형 수평 추적 시험 (2026-10-10 엔지니어 요청) ----
+  float deadbandNeutral = 1;     // 1: 정지 반경 안·도착 뒤에는 롤·피치를 중립으로 (속도 유지 제동 안 함). 0: 속도 0 유지
+  float lostNeutral = 1;         // 1: 태그 유실·신뢰도 저하 시 즉시 중립으로 복귀. 0: 광류로 속도 0 제동(HOLD)
+  float overspeedCmS = 12.0f;    // 실측 수평 속도가 이보다 크면 그 스텝의 목표 속도를 0 으로 (0.10 m/s 상한 보강)
+  float handoverSlewUsPerS = 100.0f;  // AUTO 진입 시 조종기 마지막 스틱값 → 1500 복귀 속도 (main.cpp 가 사용)
 };
 
 struct ApproachInput {
@@ -73,6 +79,10 @@ struct ApproachInput {
   bool heightValid = false;
   uint32_t heightAtMs = 0;
   float heightCm = 0;
+
+  // FC msp_override_channels 확인 결과. 스로틀 비트가 들어 있거나 아직 못 읽었으면 출력하지 않는다.
+  bool maskKnown = true;
+  bool maskOk = true;
 };
 
 enum class ApproachState : uint8_t { Idle, Approach, Arriving, Arrived, Hold, Fault };
@@ -98,6 +108,8 @@ struct ApproachOutput {
   float rollUs = 0;              // 1500 기준 오프셋
   float pitchUs = 0;
   uint32_t arriveHeldMs = 0;
+  bool neutral = false;          // deadband·도착·유실로 명령을 중립으로 수렴시키는 중
+  bool overspeed = false;        // 실측 속도가 overspeedCmS 초과 → 목표 0 으로 제동 중
 };
 
 class ApproachController {
@@ -138,6 +150,8 @@ class ApproachController {
     if (!in.enabled) fault = "disabled";
     else if (!in.authorityAuto) fault = "manual_authority";
     else if (in.kill) fault = "kill";
+    else if (!in.maskKnown) fault = "mask_unknown";
+    else if (!in.maskOk) fault = "mask";
     else if (!heightOk) fault = "height";
     else if (!velFresh) fault = "flow";
     else if (vMag > p.maxVelCmS) fault = "velocity";
@@ -179,10 +193,28 @@ class ApproachController {
         o.state = o.distCm < p.slowRadiusCm ? ApproachState::Arriving : ApproachState::Approach;
       }
     } else {
-      // 태그를 놓침 → 속도 0 으로 제동 (광류는 유효하므로 속도 루프가 멈춰 세운다)
+      // 태그를 놓침 → lostNeutral: 즉시 중립 복귀(조종자가 넘겨받음) / 아니면 광류로 속도 0 제동
       o.state = ApproachState::Hold;
       o.fault = "tag_lost";
       heldMs_ = 0;
+      if (p.lostNeutral != 0) {
+        neutralStep(o, dtS);
+        fill(o, in);
+        return o;
+      }
+    }
+
+    // 정지 반경 안·도착 뒤 → deadbandNeutral 이면 롤·피치 중립 (수평 이동 멈춤, 고도는 조종자)
+    if (tagFresh && p.deadbandNeutral != 0 && (arrived_ || o.distCm <= p.stopRadiusCm)) {
+      neutralStep(o, dtS);
+      fill(o, in);
+      return o;
+    }
+
+    // 실측 속도가 상한을 넘으면 이 스텝의 목표를 0 으로 → 속도 루프가 제동한다
+    if (vMag > p.overspeedCmS) {
+      desR = desF = 0;
+      o.overspeed = true;
     }
 
     // 가속도 제한 (벡터 크기 기준)
@@ -218,6 +250,15 @@ class ApproachController {
 
  private:
   static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // 목표 속도·적분을 비우고 명령을 변화율 한계로 0(1500) 에 수렴시킨다
+  void neutralStep(ApproachOutput &o, float dtS) {
+    vtR_ = vtF_ = 0;
+    iR_ = iF_ = 0;
+    slewTo(cmdR_, 0.0f, dtS);
+    slewTo(cmdF_, 0.0f, dtS);
+    o.neutral = true;
+  }
 
   void slewTo(float &cmd, float target, float dtS) const {
     float maxStep = p.cmdSlewUsPerS * dtS;
@@ -274,6 +315,10 @@ inline bool approachSetParam(ApproachParams &p, const char *name, float v) {
     {"att_pitch_sign", &p.attPitchSign, nullptr, nullptr},
     {"cam_off_right", &p.camOffsetRightCm, nullptr, nullptr},
     {"cam_off_fwd", &p.camOffsetFwdCm, nullptr, nullptr},
+    {"deadband_neutral", &p.deadbandNeutral, nullptr, nullptr},
+    {"lost_neutral", &p.lostNeutral, nullptr, nullptr},
+    {"overspeed", &p.overspeedCmS, nullptr, nullptr},
+    {"handover_slew", &p.handoverSlewUsPerS, nullptr, nullptr},
   };
   for (const Entry &e : table) {
     if (strcmp(e.n, name) != 0) continue;
@@ -294,11 +339,13 @@ inline int approachParamsJson(const ApproachParams &p, char *out, size_t n) {
                   "\"arrive_hold_ms\":%lu,\"tag_stale_ms\":%lu,\"flow_stale_ms\":%lu,\"flow_min_q\":%u,"
                   "\"height_stale_ms\":%lu,\"height_min\":%.0f,\"height_max\":%.0f,\"max_vel\":%.0f,"
                   "\"flow_swap\":%.0f,\"flow_fwd_sign\":%.0f,\"flow_right_sign\":%.0f,\"att_comp\":%.0f,"
-                  "\"att_roll_sign\":%.0f,\"att_pitch_sign\":%.0f,\"cam_off_right\":%.1f,\"cam_off_fwd\":%.1f}",
+                  "\"att_roll_sign\":%.0f,\"att_pitch_sign\":%.0f,\"cam_off_right\":%.1f,\"cam_off_fwd\":%.1f,"
+                  "\"deadband_neutral\":%.0f,\"lost_neutral\":%.0f,\"overspeed\":%.1f,\"handover_slew\":%.0f}",
                   p.maxSpeedCmS, p.slowRadiusCm, p.stopRadiusCm, p.maxAccelCmS2, p.velKpUsPerCmS,
                   p.velKiUsPerCm, p.velIMaxUs, p.cmdMaxUs, p.cmdSlewUsPerS, p.rollSign, p.pitchSign,
                   p.arriveTolCm, p.arriveVelCmS, (unsigned long)p.arriveHoldMs, (unsigned long)p.tagStaleMs,
                   (unsigned long)p.flowStaleMs, p.flowMinQuality, (unsigned long)p.heightStaleMs,
                   p.heightMinCm, p.heightMaxCm, p.maxVelCmS, p.flowSwapXY, p.flowFwdSign, p.flowRightSign,
-                  p.attComp, p.attRollSign, p.attPitchSign, p.camOffsetRightCm, p.camOffsetFwdCm);
+                  p.attComp, p.attRollSign, p.attPitchSign, p.camOffsetRightCm, p.camOffsetFwdCm,
+                  p.deadbandNeutral, p.lostNeutral, p.overspeedCmS, p.handoverSlewUsPerS);
 }

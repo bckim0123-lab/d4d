@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 // 빌드 식별자 (부팅 메시지에 출력)
 // ---------------------------------------------------------------------------
-#define FW_BUILD "TAGVISION-20261010-24"
+#define FW_BUILD "TAGVISION-20261010-25"
 
 // ---------------------------------------------------------------------------
 // MTF-01P (115200 8N1, 100Hz) — Micolink·MSP(INAV 출력) 자동 구분. 기존 RIDER-SERIAL 펌웨어와 같은 핀
@@ -23,19 +23,31 @@
 #define FC_RX_PIN 2             // XIAO D1 ← FC TX5
 #define FC_BAUD 115200          // INAV MSP 기본 속도
 #define MSP_ENABLED_DEFAULT true
-#define MSP_SEND_HZ 20          // INAV는 5Hz 이상을 요구 (docs/Rx.md)
-#define MSP_POLL_EVERY 1        // 매 20Hz 주기 MSP_RC 요청 → 정상 응답 기준 CH6 전환을 약 50~100ms 안에 감지
+// 2026-10-10 엔지니어 요청: CH6 위치와 무관하게 SET_RAW_RC 를 50Hz 로 계속 보낸다. INAV 는 MSP RC OVERRIDE
+// 모드(CH6)가 꺼져 있으면 프레임을 무시하므로(rx.c: IS_RC_MODE_ACTIVE(BOXMSPRCOVERRIDE) 일 때만 적용),
+// AUTO 로 바뀌는 순간 이미 최신 프레임이 FC 안에 있어 통신 대기·초기화 지연이 없다.
+#define MSP_SEND_HZ 50          // INAV msp_override 는 50Hz 로 채널을 갱신한다 (DELAY_50_HZ)
+#define MSP_TX_ALWAYS true      // false 면 예전처럼 CH6=AUTO 일 때만 보낸다
+#define MSP_POLL_EVERY 1        // 매 주기 MSP_RC 요청 (50Hz) → CH6 전환을 한두 주기(20~40ms) 안에 감지
 #define MSP_LINK_TIMEOUT_MS 1000
 #define MSP_CHANNELS 8          // 롤·피치·스로틀·요 + AUX 4개 (AUX는 INAV 마스크에 넣지 않으면 무시됨)
 
-// MSP 프레임의 채널 위치. 수신기와 같은 순서(INAV Channel Map)여야 한다. INAV 기본 AETR 기준.
-#define MSP_CH_ROLL 0
-#define MSP_CH_PITCH 1
-#define MSP_CH_THROTTLE 2
-#define MSP_CH_YAW 3
+// MSP_SET_RAW_RC 프레임의 채널 위치는 수신기 순서(INAV rcmap)다. INAV 9.1 rx/msp_override.c 는
+// 논리 채널 i 의 값을 frame[rcmap[i]] 에서 읽는다. 기본 AETR 이면 rcmap = {0,1,3,2}:
+//   frame[0]=롤, frame[1]=피치, frame[2]=스로틀, frame[3]=요.
+// 부팅 뒤 MSP_RX_MAP(64) 으로 실제 rcmap 을 읽어 쓰고, 못 읽으면 아래 기본값을 쓴다.
+#define RCMAP_DEFAULT {0, 1, 3, 2}
+// FC_CFG_POLL_MS 마다 rcmap 과 msp_override_channels 를 다시 읽는다 (CLI 로 바꾼 뒤 반영 확인용)
+#define FC_CFG_POLL_MS 2000
 
-// FC가 돌려주는 MSP_RC는 ROLL·PITCH·YAW·THROTTLE·AUX 순서다(송신 AETR과 다름).
+// INAV 논리 채널 순서 (rcData / MSP_RC / msp_override_channels 비트): 롤 0, 피치 1, 요 2, 스로틀 3.
+// → 롤·피치·요만 덮어쓰는 마스크는 7, 스로틀 비트는 8. 기체 rcmap 과 무관하게 논리 비트다.
+#define FC_RC_CH_ROLL 0
+#define FC_RC_CH_PITCH 1
+#define FC_RC_CH_YAW 2
 #define FC_RC_CH_THROTTLE 3
+#define OVERRIDE_MASK_THROTTLE_BIT (1u << FC_RC_CH_THROTTLE)
+#define OVERRIDE_MASK_RECOMMENDED 7u   // 롤+피치+요. 보드 킬(ch7)까지 쓰려면 7+64 = 71
 #define FC_RC_CH_ARM 4
 #define FC_RC_SAFE_MAX_US 1100
 
@@ -48,28 +60,32 @@
 
 // 킬(정지) 채널: 보드가 이 채널을 KILL_ON_US로 보내면 INAV FAILSAFE 모드(DROP)가 켜져 즉시 디스아밍된다.
 // 20261010 FC 설정 기준: ch5=ARM, ch6=MSP RC OVERRIDE(900~1700, 스위치 올림), ch8=ANGLE(항상).
-// 그래서 킬은 ch7(인덱스 6). INAV 설정 필요: aux 3 27 2 1700 2100 / set msp_override_channels = 67
-// 67은 롤(1)+피치(2)+킬 ch7(64)이며, 보드는 끌 수만 있고 아밍은 못 한다.
+// 그래서 킬은 ch7(인덱스 6). INAV 설정 필요: aux 3 27 2 1700 2100 / set msp_override_channels = 71
+// 71은 롤(1)+피치(2)+요(4)+킬 ch7(64)이며, 보드는 끌 수만 있고 아밍은 못 한다. 마스크가 7 이면 보드 킬은
+// FC 에 반영되지 않는다(조종기 CH7 킬만 동작).
 #define MSP_CH_KILL 6
 #define KILL_ON_US 2000
 #define KILL_OFF_US 1000
 
-// FC 상태 읽기: 20Hz 주기 중 이 간격마다 상태·배터리·모터 출력을 번갈아 요청 (각 2Hz)
-#define FC_POLL_PERIOD 10
+// FC 상태 읽기: 50Hz 주기 중 이 간격마다 상태·배터리·모터 출력을 번갈아 요청 (각 2Hz)
+#define FC_POLL_PERIOD 25
 #define FC_STATUS_SAFE_TIMEOUT_MS 1000  // 모터 시험은 이보다 오래된 아밍 상태로 시작·지속하지 않음
 
 // 높이: 20261010부터 MTF-01P는 FC UART4에 연결한다(INAV rangefinder·opflow = MSP).
 // 보드에 MTF-01P 데이터가 직접 들어오지 않으면 FC의 거리센서 값(MSP_SONAR_ALTITUDE, cm)을 대신 쓴다.
-// 20Hz 주기 중 이 간격마다 한 번 요청 → 2 = 10Hz
-#define FC_ALT_POLL_EVERY 2
+// 50Hz 주기 중 이 간격마다 한 번 요청 → 5 = 10Hz
+#define FC_ALT_POLL_EVERY 5
+// MTF-01 수직 속도 경고: |vz| 가 이 값을 넘으면 경고만 기록한다. 보드는 스로틀(CH3)을 절대 건드리지 않는다.
+#define VZ_WARN_CM_S 10.0f
+#define VZ_WARN_REPEAT_MS 1000
 
-// 접근 제어 (src/approach.h): 광류·자세를 FC에서 읽는 주기 (20Hz 주기 중 간격)
-#define FC_FLOW_POLL_EVERY 1    // MSP2_INAV_OPTICAL_FLOW 20Hz
-#define FC_ATT_POLL_EVERY 2     // MSP_ATTITUDE 10Hz
+// 접근 제어 (src/approach.h): 광류·자세를 FC에서 읽는 주기 (50Hz 주기 중 간격)
+#define FC_FLOW_POLL_EVERY 2    // MSP2_INAV_OPTICAL_FLOW 25Hz
+#define FC_ATT_POLL_EVERY 5     // MSP_ATTITUDE 10Hz
 // 부팅 시 접근 제어 모드: 0 off · 1 shadow(계산·로그만, FC에는 중립) · 2 on · 3 legacy(아래 4µs/cm 위치 제어)
 // 검증 전에는 shadow 로 올린다. `approach on|shadow|legacy|off`로 바꾼다.
 #define APPROACH_MODE_DEFAULT 1
-#define APPROACH_REPORT_EVERY 4 // approach JSON 5Hz
+#define APPROACH_REPORT_EVERY 10 // approach JSON 5Hz (50Hz 주기 기준)
 
 // 착륙 지점 오프셋(cm) → 스틱 값(µs). 1500 중립에서 ±만큼 움직인다. (approach legacy 모드에서만 사용)
 // INAV 쪽 비행 모드에 따라 의미가 다르다: ANGLE은 기울기, POSHOLD는 속도 명령.
@@ -84,6 +100,8 @@
 // 1500(중간)을 보내면 FC의 msp_override_channels 마스크에 스로틀 비트(8)가 잘못 들어가 있을 때
 // CH6=AUTO 전환 순간 스로틀이 절반으로 뛴다 (2026-10-10 엔지니어 보고). min_check(1100) 아래 값으로 고정한다.
 // 조종기 값을 되돌려 주는 방식은 쓰지 않는다: 마스크에 스로틀이 있으면 MSP_RC 가 이미 덮어쓴 값을 돌려줘 되먹임된다.
+// 이 값은 마스크가 올바르면(스로틀 비트 없음) FC 가 무시한다. 마스크에 스로틀이 있으면 접근 제어기는 fault "mask" 로
+// 출력을 멈추고, 보드가 `msp` JSON 의 mask_ok=false 로 알린다.
 #define MSP_THROTTLE_SAFE_US 1000
 #define CTRL_Z_US_PER_CM 3.0f
 #define CTRL_Z_MAX_US 60

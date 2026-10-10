@@ -9,7 +9,9 @@
 static const uint16_t MSP_MOTOR = 104;          // FC가 모터에 실제로 내보내는 값 8개
 static const uint16_t MSP_RC = 105;
 static const uint16_t MSP_SONAR_ALTITUDE = 58;   // FC 거리센서 높이(cm, int32, 기울기 보정). 범위 밖이면 음수
+static const uint16_t MSP_RX_MAP = 64;           // rcmap[4]: 논리 채널(롤·피치·요·스로틀) → 수신기 슬롯
 static const uint16_t MSP_REBOOT = 68;
+static const uint16_t MSP2_COMMON_SETTING = 0x1003; // 설정 이름("...\0") → 값 (msp_override_channels 확인)
 static const uint16_t MSP_SET_RAW_RC = 200;
 static const uint16_t MSP_SET_MOTOR = 214;      // 아밍 전 모터 출력 직접 지정 (INAV Configurator 모터 시험과 같음)
 static const uint16_t MSP_ATTITUDE = 108;       // 롤·피치(0.1°)·요(°) — 카메라 지면점 기울기 보정용
